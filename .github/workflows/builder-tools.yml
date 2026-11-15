@@ -54,7 +54,12 @@ jobs:
       - name: Configure and make (the build Python, then the host's)
         run: |
           cd cpython
-          python3 Android/android.py --verbose build $HOST
+          # --verbose is the subcommand's own flag (before it the whole command
+          # is rejected), and the host's configure needs the build Python made
+          # first (its --with-build-python), so: the build platform, then this
+          # host only (the default target, all, would build all four hosts).
+          python3 Android/android.py build --verbose build
+          python3 Android/android.py build --verbose "$HOST"
 
       - name: Package
         run: |
