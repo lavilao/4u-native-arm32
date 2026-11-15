@@ -29,9 +29,13 @@ VkCommandBuffer CommandBuffer(Recorder& recorder) {
     return impl.vulkan_list()->vk;
 }
 
-// A VkSurfaceKHR is a pointer on the 64-bit targets of the port (no 32-bit target is built).
-static_assert(std::is_pointer_v<VkSurfaceKHR> && sizeof(VkSurfaceKHR) == sizeof(u64),
-              "non-dispatchable handles are 64-bit pointers");
+// A VkSurfaceKHR is a pointer on the 64-bit targets of the port, and a plain 64-bit integer on
+// its 32-bit build (the Vulkan headers' own split, VK_USE_64_BIT_PTR_DEFINES): either way the
+// 8 bytes SurfaceHandle carries it as, and the casts below are integer-to-integer on 32-bit.
+static_assert(sizeof(VkSurfaceKHR) == sizeof(u64), "a non-dispatchable handle is 8 bytes");
+#ifdef __LP64__
+static_assert(std::is_pointer_v<VkSurfaceKHR>, "non-dispatchable handles are 64-bit pointers");
+#endif
 
 SurfaceHandle SurfaceFrom(VkSurfaceKHR surface) {
     SurfaceHandle handle;

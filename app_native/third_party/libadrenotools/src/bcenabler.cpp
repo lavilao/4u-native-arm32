@@ -27,7 +27,7 @@ static void *find_free_page(uintptr_t address) {
 
     for (std::string line; std::getline(procMaps, line); ) {
         std::size_t addressSeparator{line.find('-')};
-        uintptr_t start{std::strtoull(line.substr(0, addressSeparator).c_str(), nullptr, 16)};
+        uintptr_t start{static_cast<uintptr_t>(std::strtoull(line.substr(0, addressSeparator).c_str(), nullptr, 16))};
 
         if (end > address && start != end)
             return reinterpret_cast<void *>(end);
