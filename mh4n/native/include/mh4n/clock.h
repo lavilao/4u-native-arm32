@@ -31,6 +31,7 @@ inline constexpr u64 kNanosecondsPerSecond = 1000000000;
 // scheduler switch): the whole seconds (or whole tick-seconds) apart from the rest, which stays inside 64 bits, each
 // divided by a constant. Exact for every input, as the 128-bit forms they replace (kept below for the checks).
 namespace clock_detail {
+#ifdef __SIZEOF_INT128__
 constexpr u64 NsToTicks128(u64 ns) {
     const unsigned __int128 ticks = static_cast<unsigned __int128>(ns) * kTicksPerSecond / kNanosecondsPerSecond;
     return ticks > ~u64{0} ? ~u64{0} : static_cast<u64>(ticks);
@@ -44,6 +45,12 @@ constexpr u64 TicksToNsCeil128(u64 ticks) {
         (static_cast<unsigned __int128>(ticks) * kNanosecondsPerSecond + kTicksPerSecond - 1) / kTicksPerSecond;
     return ns > ~u64{0} ? ~u64{0} : static_cast<u64>(ns);
 }
+#else
+// ARMv7 (the app's armeabi-v7a build) has no __int128: the exact forms the overflow branches
+// below call are defined under the split ones, which come first here.
+constexpr u64 TicksToNs128(u64 ticks);
+constexpr u64 TicksToNsCeil128(u64 ticks);
+#endif
 }  // namespace clock_detail
 
 // Ticks in `ns` nanoseconds, rounded down. Saturates at the largest u64 (never reached: u64 nanoseconds are fewer ticks).
@@ -66,6 +73,31 @@ constexpr u64 TicksToNsCeil(u64 ticks) {
     return q * kNanosecondsPerSecond + (r * kNanosecondsPerSecond + kTicksPerSecond - 1) / kTicksPerSecond;
 }
 
+#ifndef __SIZEOF_INT128__
+namespace clock_detail {
+// The overflow branches' exactness without 128 bits. There q is at least kOverflowQ, where the
+// whole seconds alone come against u64's end: either q is past it (the result saturates, whatever
+// the rest is), or q is exactly it, the whole seconds still inside u64 and the rest (always under
+// a second) deciding between the last representable value and saturation.
+constexpr u64 kOverflowQ = (~u64{0} - kNanosecondsPerSecond) / kNanosecondsPerSecond + 1;
+constexpr u64 kOverflowBase = kOverflowQ * kNanosecondsPerSecond;
+constexpr u64 kOverflowRest = ~u64{0} - kOverflowBase;
+constexpr u64 TicksToNs128(u64 ticks) {
+    const u64 q = ticks / kTicksPerSecond, r = ticks % kTicksPerSecond;
+    if (q > kOverflowQ) return ~u64{0};
+    const u64 rest = r * kNanosecondsPerSecond / kTicksPerSecond;
+    return rest > kOverflowRest ? ~u64{0} : kOverflowBase + rest;
+}
+constexpr u64 TicksToNsCeil128(u64 ticks) {
+    const u64 q = ticks / kTicksPerSecond, r = ticks % kTicksPerSecond;
+    if (q > kOverflowQ) return ~u64{0};
+    const u64 rest = (r * kNanosecondsPerSecond + kTicksPerSecond - 1) / kTicksPerSecond;
+    return rest > kOverflowRest ? ~u64{0} : kOverflowBase + rest;
+}
+}  // namespace clock_detail
+#endif
+
+#ifdef __SIZEOF_INT128__
 namespace clock_detail {
 // The split forms against the 128-bit ones, at the edges and in between
 constexpr bool SameAt(u64 v) {
@@ -77,6 +109,7 @@ static_assert(SameAt(0) && SameAt(1) && SameAt(kTicksPerSecond - 1) && SameAt(kT
               SameAt(0x7FFFFFFFFFFFFFFFull) && SameAt(~u64{0} - 1) && SameAt(~u64{0}) &&
               SameAt(kTicksPerSecond * 1000003ull + 268111855ull) && SameAt(999999999999999999ull));
 }  // namespace clock_detail
+#endif
 
 // ---- host time ---------------------------------------------------------------------------------------
 
