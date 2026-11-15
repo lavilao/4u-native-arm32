@@ -17,6 +17,10 @@ libmh4u_code*.dll
 *.keystore
 *.jks
 keystore.properties
+# this fork's CI signs every APK with this one, so one build replaces the last (android/mh4u.keystore,
+# android/keystore.properties; a key anyone can read: it only says who signed these APKs)
+!android/mh4u.keystore
+!android/keystore.properties
 
 # built
 build/

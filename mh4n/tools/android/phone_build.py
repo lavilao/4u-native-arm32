@@ -241,15 +241,21 @@ class Tail(io.TextIOBase):
 
 
 def whole_object(path: str) -> bool:
-    """An ELF object whose section headers are all inside the file: one cut short while it was written isn't."""
+    """An ELF object whose section headers are all inside the file: one cut short while it was written isn't.
+    The library is built for the machine it runs on (arm64 on such a phone, ARM 32-bit on an
+    armeabi-v7a one), so both ELF classes are read."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
             head = f.read(64)
-        if len(head) < 64 or head[:4] != b"\x7fELF" or head[4] != 2:
+        if len(head) < 64 or head[:4] != b"\x7fELF" or head[4] not in (1, 2):
             return False
-        shoff = struct.unpack_from("<Q", head, 40)[0]
-        shentsize, shnum = struct.unpack_from("<HH", head, 58)
+        if head[4] == 2:
+            shoff = struct.unpack_from("<Q", head, 40)[0]
+            shentsize, shnum = struct.unpack_from("<HH", head, 58)
+        else:
+            shoff = struct.unpack_from("<I", head, 32)[0]
+            shentsize, shnum = struct.unpack_from("<HH", head, 46)
         return shoff > 0 and shoff + shentsize * shnum <= size
     except OSError:
         return False

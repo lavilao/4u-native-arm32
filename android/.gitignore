@@ -4,4 +4,8 @@ app/build/
 local.properties
 keystore.properties
 *.keystore
+# this fork's CI signs every APK with this one, so one build replaces the last; a key anyone can
+# read: it only says who signed these APKs
+!mh4u.keystore
+!keystore.properties
 app/src/main/jniLibs/

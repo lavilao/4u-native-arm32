@@ -1,0 +1,105 @@
+# The app's APKs: the arm64-v8a one as upstream builds it, and the armeabi-v7a one of this fork
+# (the 32-bit phones the port runs on: a 1 GiB guest memory instead of the 4 GiB reservation, ARM
+# fibers, the builder's tools of that architecture). The 32-bit APK pins the SHA-256 of the 32-bit
+# builder's CPython (the builder-tools release, made by "The 32-bit builder's CPython" workflow)
+# into its assets, where BuilderTools reads it.
+#
+# Both are signed with android/mh4u.keystore, so one build replaces the last without touching the
+# game folder or the saves. Without a game dump nothing here contains game data.
+name: The Android APKs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    name: The ${{ matrix.abi }} APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a]
+    env:
+      ANDROID_ABI: ${{ matrix.abi }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: The Android SDK and NDK the scripts ask for
+        run: |
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -Lf --retry 5 -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q tools.zip -d "$HOME/android-sdk/cmdline-tools"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "ndk;27.0.12077973" >/dev/null
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+
+      - name: CMake and Ninja
+        run: python3 -m pip install --quiet 'cmake>=3.25' ninja
+
+      # The 32-bit builder's CPython: pinned by hash into the APK for BuilderTools to check
+      - name: The 32-bit builder's CPython, its SHA-256 pinned into the APK
+        if: matrix.abi == 'armeabi-v7a'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p android/app/src/main/assets/builder
+          URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/builder-tools/python-3.14.9-arm-linux-androideabi.tar.gz"
+          if ! gh release view builder-tools --repo "$GITHUB_REPOSITORY" --json assets \
+                | grep -q 'python-3.14.9-arm-linux-androideabi.tar.gz'; then
+            echo "No 32-bit CPython on the builder-tools release: run the 'The 32-bit builder's CPython' workflow once first." >&2
+            exit 1
+          fi
+          curl -Lf --retry 5 -o python32.tar.gz "$URL"
+          SHA=$(sha256sum python32.tar.gz | cut -d' ' -f1)
+          SIZE=$(stat -c%s python32.tar.gz)
+          { echo "version=3.14.9"
+            echo "url=$URL"
+            echo "sha256=$SHA"
+            echo "size=$SIZE"
+          } > android/app/src/main/assets/builder/python32.properties
+          echo "pinned: $SHA ($SIZE bytes)"
+
+      - name: SDL3
+        run: sh scripts/build_sdl3.sh
+
+      - name: The APK
+        run: |
+          if [ "$ANDROID_ABI" = armeabi-v7a ]; then export MH4N_ANDROID_ARCH=arm; fi
+          sh scripts/build_apk.sh
+
+      - name: The APK under its own name
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk android/app/build/outputs/apk/debug/*.apk 2>/dev/null | head -n1)
+          cp "$APK" "MH4U-32bit-port-$(git rev-parse --short HEAD)-$ANDROID_ABI.apk"
+          ls -l MH4U-32bit-port-*.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.abi }}
+          path: MH4U-32bit-port-*.apk
+          retention-days: 30
+
+      - name: Onto the builder-tools release, beside the CPython
+        if: matrix.abi == 'armeabi-v7a' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls MH4U-32bit-port-*-$ANDROID_ABI.apk)
+          if gh release view builder-tools --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload builder-tools "$APK" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            printf 'The 32-bit builder\u2019s tools.' > notes.md
+            gh release create builder-tools "$APK" --title "The builder's tools" --notes-file notes.md --prerelease --repo "$GITHUB_REPOSITORY"
+          fi

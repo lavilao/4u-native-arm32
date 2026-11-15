@@ -129,6 +129,12 @@ void OnSignal(int sig, siginfo_t* info, void* context) {
             PutAddress("pc", static_cast<uintptr_t>(uc->uc_mcontext.pc));
             PutAddress("lr", static_cast<uintptr_t>(uc->uc_mcontext.regs[30]));
         }
+#elif defined(__arm__)
+        if (context != nullptr) {
+            const auto* uc = static_cast<const ucontext_t*>(context);
+            PutAddress("pc", static_cast<uintptr_t>(uc->uc_mcontext.arm_pc));
+            PutAddress("lr", static_cast<uintptr_t>(uc->uc_mcontext.arm_lr));
+        }
 #endif
         Backtrace bt;
         _Unwind_Backtrace(Step, &bt);

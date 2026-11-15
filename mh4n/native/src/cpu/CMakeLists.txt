@@ -10,10 +10,15 @@ set(MH4N_RECOMP_RUNTIME "${MH4N_REPO_ROOT}/tools/recomp/runtime")
 # module; cpu_test.cpp then has nothing to test.
 if (EXISTS "${MH4N_FIBER_SOURCE}" AND EXISTS "${MH4N_RECOMP_RUNTIME}/recomp.h")
     set(mh4n_cpu_sources code_host.cpp code_library.cpp "${MH4N_FIBER_SOURCE}")
-    # Android: bionic has no getcontext/swapcontext; fiber.cpp switches with this AArch64 routine
+    # Android: bionic has no getcontext/swapcontext; fiber.cpp switches with this routine, of the
+    # build's architecture (arm64-v8a or armeabi-v7a)
     if (ANDROID)
         enable_language(ASM)
-        list(APPEND mh4n_cpu_sources "${MH4N_REPO_ROOT}/port/src/fiber_arm64.S")
+        if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+            list(APPEND mh4n_cpu_sources "${MH4N_REPO_ROOT}/port/src/fiber_arm64.S")
+        else()
+            list(APPEND mh4n_cpu_sources "${MH4N_REPO_ROOT}/port/src/fiber_arm32.S")
+        endif()
     endif()
 else()
     message(STATUS "mh4n_cpu: fiber.cpp or recomp.h not found around native/: an empty module")
