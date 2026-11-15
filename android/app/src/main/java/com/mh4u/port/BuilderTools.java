@@ -87,7 +87,7 @@ final class BuilderTools {
             p.clear();
         }
         String url = p.getProperty("url",
-                "https://github.com/lavilao/4u-native/releases/download/builder-tools/"
+                "https://github.com/lavilao/4u-native-arm32/releases/download/builder-tools/"
                 + "python-3.14.9-arm-linux-androideabi.tar.gz");
         return new Tool("python", p.getProperty("version", "3.14.9"), url,
                 p.getProperty("sha256", ""), Long.parseLong(p.getProperty("size", "0")));
