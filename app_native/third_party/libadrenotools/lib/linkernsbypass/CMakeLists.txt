@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.14)
 
-if(NOT ${CMAKE_ANDROID_ARCH_ABI} STREQUAL arm64-v8a)
-	message(FATAL_ERROR "Unsupported target architecture: ${CMAKE_ANDROID_ARCH_ABI}. Please make an issue on the repo!")
+# mh4n: the app is built for arm64-v8a and, as its 32-bit build, armeabi-v7a (the soname
+# patcher rewrites the strings of whatever ELF it is handed, 32- or 64-bit, and the namespace
+# bypass itself is the bionic linker's, either way)
+if(NOT ${CMAKE_ANDROID_ARCH_ABI} STREQUAL arm64-v8a AND NOT ${CMAKE_ANDROID_ARCH_ABI} STREQUAL armeabi-v7a)
+        message(FATAL_ERROR "Unsupported target architecture: ${CMAKE_ANDROID_ARCH_ABI}. Please make an issue on the repo!")
 endif()
 
 project(linkernsbypass LANGUAGES CXX)
