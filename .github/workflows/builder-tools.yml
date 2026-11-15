@@ -26,7 +26,9 @@ env:
 
 jobs:
   python:
-    name: CPython for ${{ env.HOST }}
+    # No env context here: jobs.<job_id>.name only takes github, needs, strategy, matrix, vars and
+    # inputs (the workflow is not valid otherwise, as the first push showed).
+    name: CPython for Android arm
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
