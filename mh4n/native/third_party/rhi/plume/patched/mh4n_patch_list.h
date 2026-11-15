@@ -28,6 +28,7 @@ inline constexpr const char* kPatchFiles[] = {
     "21-implied-transfer-queue.diff",
     "22-pipeline-results.diff",
     "23-submit-result.diff",
-    "24-win32-shared-memory.diff"
+    "24-vulkan-1.1-instance.diff",
+    "25-win32-shared-memory.diff"
 };
 }  // namespace mh4n_rhi_plume

@@ -1,7 +1,13 @@
-# Sourced by build_sdl3.sh and build_apk.sh: finds the Android SDK and NDK, CMake, Ninja and Python.
+# Sourced by build_sdl3.sh and build_apk.sh: finds the Android SDK and NDK, CMake, Ninja and Python, and sets
+# ABI (the app is built for arm64-v8a; ANDROID_ABI=armeabi-v7a in the environment selects the 32-bit build).
 # Override any of them with ANDROID_SDK_ROOT (or ANDROID_HOME), ANDROID_NDK_HOME, CMAKE, NINJA, PYTHON.
 NDK_VERSION=27.0.12077973
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ABI=${ANDROID_ABI:-arm64-v8a}
+case "$ABI" in
+    arm64-v8a|armeabi-v7a) ;;
+    *) echo "Unknown ANDROID_ABI '$ABI' (arm64-v8a or armeabi-v7a)" >&2; exit 1 ;;
+esac
 
 # a path as CMake and the compilers want it (Git Bash on Windows: E:/x/y, elsewhere unchanged)
 native_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }

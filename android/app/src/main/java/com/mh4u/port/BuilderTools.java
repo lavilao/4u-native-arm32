@@ -2,6 +2,7 @@ package com.mh4u.port;
 
 import android.content.Context;
 import android.content.pm.PackageInfo;
+import android.os.Build;
 
 import java.io.BufferedInputStream;
 import java.io.File;
@@ -52,7 +53,45 @@ final class BuilderTools {
             "https://files.pythonhosted.org/packages/b8/d9/d5e808cbfa20d6b566c27f3445fea30b5ec86d7b45dad237fdc7a8754f53/"
             + "ziglang-0.13.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl",
             "5714a4d46f9246ba6180a0930e23df2bc8bc26e62b5fe0dc798b4afca1903308", 77819666L);
-    static final Tool[] DOWNLOADS = {PYTHON, ZIG};
+
+    // The same tools for a 32-bit phone (the app's armeabi-v7a build, whose uname says armv7l or
+    // armv8l): python.org publishes Android builds for aarch64 and x86_64 only, so this project's
+    // release carries a CPython built for Android's arm with python.org's own recipe (the Android/
+    // folder of the CPython source; the workflow .github/workflows/builder-tools.yml builds it),
+    // and its SHA-256 and size are pinned in assets/builder/python32.properties — written by the
+    // APK workflow as it builds, so they are as fixed in it as the ones above are in code. Zig's
+    // armv7l wheel is the same static musl build as the aarch64 one, and runs on Android.
+    static final Tool ZIG_32 = new Tool("zig", "0.13.0",
+            "https://files.pythonhosted.org/packages/3b/a4/dab4ddb824033b369db78235aeaa5b92f710ec01bf1e255edcb9730097a3/"
+            + "ziglang-0.13.0-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.musllinux_1_1_armv7l.whl",
+            "64458dbe4f8c09ae3f99897d5bf2ac343be5366079dce383e286832f17747e94", 78762501L);
+
+    /** The tools this phone's architecture runs: aarch64's are the constants; a 32-bit ARM
+     *  phone's are the arm ones (the Python of the project's release, its hash read from the
+     *  APK's assets as built). */
+    static Tool[] downloads(Context c) {
+        String primary = Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0
+                ? Build.SUPPORTED_ABIS[0] : "";
+        if (primary.equals("arm64-v8a"))
+            return new Tool[]{PYTHON, ZIG};
+        return new Tool[]{python32(c), ZIG_32};
+    }
+
+    private static Tool python32(Context c) {
+        // (a build without the file — one not made by the workflow — keeps the URL and an empty
+        // hash: the download then stops with its own message, instead of the app crashing here)
+        java.util.Properties p = new java.util.Properties();
+        try (InputStream in = c.getAssets().open("builder/python32.properties")) {
+            p.load(in);
+        } catch (IOException e) {
+            p.clear();
+        }
+        String url = p.getProperty("url",
+                "https://github.com/lavilao/4u-native/releases/download/builder-tools/"
+                + "python-3.14.9-arm-linux-androideabi.tar.gz");
+        return new Tool("python", p.getProperty("version", "3.14.9"), url,
+                p.getProperty("sha256", ""), Long.parseLong(p.getProperty("size", "0")));
+    }
     /** What the tools take once unpacked (Zig's program alone is 141 MB). */
     static final long INSTALLED_SIZE = 200L << 20;
 
@@ -85,7 +124,7 @@ final class BuilderTools {
     /** The bytes still to download (0 when everything is in place). */
     static long toDownload(Context c) {
         long n = 0;
-        for (Tool t : DOWNLOADS)
+        for (Tool t : downloads(c))
             if (!installed(c, t)) n += t.size - Math.max(0, Math.min(t.size, part(c, t).length()));
         return n;
     }
@@ -93,7 +132,7 @@ final class BuilderTools {
     /** The space the tools still need on the phone (the downloads and what they unpack to). */
     static long toInstall(Context c) {
         long n = 0;
-        for (Tool t : DOWNLOADS) if (!installed(c, t)) n += t.size + (t == ZIG ? 170L << 20 : 30L << 20);
+        for (Tool t : downloads(c)) if (!installed(c, t)) n += t.size + (t.name.equals("zig") ? 170L << 20 : 30L << 20);
         return n;
     }
 
@@ -106,7 +145,7 @@ final class BuilderTools {
     static void ensure(Context c, Progress p) throws IOException {
         root(c).mkdirs();
         unpackScripts(c);
-        for (Tool t : DOWNLOADS) {
+        for (Tool t : downloads(c)) {
             if (installed(c, t)) continue;
             long t0 = System.currentTimeMillis(), had = part(c, t).length();
             File archive = download(c, t, p);
@@ -205,7 +244,8 @@ final class BuilderTools {
     }
 
     /** From python.org's archive (./prefix/...): the library and the standard library, without its tests and the parts
-     *  that need OpenSSL or SQLite (their modules fall back on Python's own: hashlib's built-in hashes). */
+     *  that need OpenSSL or SQLite (their modules fall back on Python's own: hashlib's built-in hashes). The 32-bit
+     *  build's archive (the project's release) is made by the same recipe and has the same layout. */
     private static void unpackPython(File archive, File dest, Progress p) throws IOException {
         String[] skipDirs = {"test/", "idlelib/", "tkinter/", "turtledemo/", "ensurepip/", "pydoc_data/", "__phello__/",
                              "config-3."};

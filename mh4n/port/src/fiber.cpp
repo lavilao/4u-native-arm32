@@ -74,11 +74,9 @@ void Fiber::SwitchTo(Fiber& next) {
 #elif defined(__ANDROID__)
 
 // Android's bionic has <ucontext.h> but no getcontext/makecontext/swapcontext, so the
-// context switch is the small AArch64 routine in fiber_arm64.S. Android builds here are
-// arm64-v8a only (see android/app/build.gradle.kts).
-#if !defined(__aarch64__)
-#error "the MH4U port's Android fibers are AArch64-only"
-#endif
+// context switch is the small routine of fiber_arm64.S or fiber_arm32.S: the app is built for
+// arm64-v8a and, as this port's 32-bit build, armeabi-v7a.
+#if defined(__aarch64__)
 
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -153,6 +151,90 @@ Fiber::~Fiber() {
 void Fiber::SwitchTo(Fiber& next) {
     mh4u_fiber_switch(&impl->context, &next.impl->context);
 }
+
+#elif defined(__arm__)
+
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+
+namespace {
+
+// The AAPCS callee-saved registers of a 32-bit ARM thread (fiber_arm32.S saves and restores these
+// in this order): r4-r11, lr, sp, then d8-d15 (each 64-bit), and the first entry's argument.
+struct ArmContext {
+    std::uint32_t r4, r5, r6, r7, r8, r9, r10, r11;
+    std::uint32_t lr;
+    std::uint32_t sp;
+    std::uint64_t d[8]; // d8-d15
+    std::uint32_t arg;  // r0 when the context is first entered
+};
+
+static_assert(offsetof(ArmContext, lr) == 32);
+static_assert(offsetof(ArmContext, sp) == 36);
+static_assert(offsetof(ArmContext, d) == 40);
+static_assert(offsetof(ArmContext, arg) == 104);
+static_assert(sizeof(ArmContext) == 112);
+
+extern "C" void mh4u_fiber_switch(ArmContext* from, ArmContext* to);
+
+} // namespace
+
+struct Fiber::Impl {
+    ArmContext context{};
+    void* stack = nullptr;
+    std::size_t stack_size = 0; // including the guard page
+    std::function<void()> entry;
+};
+
+extern "C" void mh4u_fiber_entry(void* impl_ptr) {
+    auto* impl = static_cast<Fiber::Impl*>(impl_ptr);
+    impl->entry();
+    std::fprintf(stderr, "fiber entry returned\n");
+    std::abort();
+}
+
+std::unique_ptr<Fiber> Fiber::FromCurrentThread() {
+    return std::unique_ptr<Fiber>(new Fiber(std::make_unique<Impl>()));
+}
+
+std::unique_ptr<Fiber> Fiber::Create(std::function<void()> entry, std::size_t stack_size) {
+    auto impl = std::make_unique<Impl>();
+    impl->entry = std::move(entry);
+    const std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    stack_size = (stack_size + page - 1) / page * page;
+    impl->stack_size = stack_size + page;
+    // Reserve lazily; the lowest page stays inaccessible to catch stack overflows.
+    impl->stack = mmap(nullptr, impl->stack_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (impl->stack == MAP_FAILED) {
+        std::perror("mmap fiber stack");
+        std::abort();
+    }
+    mprotect(impl->stack, page, PROT_NONE);
+    auto* top = static_cast<std::uint8_t*>(impl->stack) + impl->stack_size;
+    top = reinterpret_cast<std::uint8_t*>(reinterpret_cast<std::uintptr_t>(top) &
+                                          ~std::uintptr_t{15});
+    impl->context.sp = reinterpret_cast<std::uint32_t>(top);
+    impl->context.r11 = 0; // frame pointer chain ends here
+    impl->context.lr = reinterpret_cast<std::uint32_t>(&mh4u_fiber_entry); // (the Thumb bit stays: bx)
+    impl->context.arg = reinterpret_cast<std::uint32_t>(impl.get());
+    return std::unique_ptr<Fiber>(new Fiber(std::move(impl)));
+}
+
+Fiber::~Fiber() {
+    if (impl->stack) {
+        munmap(impl->stack, impl->stack_size);
+    }
+}
+
+void Fiber::SwitchTo(Fiber& next) {
+    mh4u_fiber_switch(&impl->context, &next.impl->context);
+}
+
+#else
+#error "the port's Android fibers are AArch64 or ARM (armeabi-v7a) only"
+#endif
 
 #else
 

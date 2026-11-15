@@ -48,10 +48,19 @@ namespace mh4n {
 
 inline constexpr u32 kPageSize = 0x1000;       // the guest's page
 inline constexpr u32 kPageMask = kPageSize - 1;
-inline constexpr u64 kAddressSpaceSize = 1ull << 32;
-inline constexpr u64 kGuardSize = 0x10000;     // inaccessible host address space after the 4 GiB
 // The kernel manages [0, 0x40000000) (Azahar's VMManager::MAX_ADDRESS, the New 3DS limit).
 inline constexpr u32 kManagedEnd = 0x40000000;
+// A 64-bit host reserves the guest's whole 4 GiB address space (a guest address beyond it lands in
+// the guard). A 32-bit host (the app's armeabi-v7a build) has no 4 GiB to give, and nothing beyond
+// the managed range can be mapped anyway (kManagedEnd, which the kernel honours), so it reserves
+// only that plus the guard; a guest address beyond it wraps the host's 32-bit pointer arithmetic
+// to below the reservation and faults there, loudly, instead of in the guard.
+#ifdef __LP64__
+inline constexpr u64 kAddressSpaceSize = 1ull << 32;
+#else
+inline constexpr u64 kAddressSpaceSize = kManagedEnd;
+#endif
+inline constexpr u64 kGuardSize = 0x10000;     // inaccessible host address space after the guest's
 
 inline constexpr u32 kProcessImageVaddr = 0x00100000;
 inline constexpr u32 kHeapVaddr = 0x08000000;

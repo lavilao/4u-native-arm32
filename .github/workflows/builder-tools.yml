@@ -1,0 +1,93 @@
+# The 32-bit builder's CPython: python.org publishes Android builds for aarch64 and x86_64 only,
+# so this workflow builds CPython 3.14.9 for arm-linux-androideabi with python.org's own recipe
+# (the Android/ folder of the CPython source, the same that makes the published ones: the NDK
+# toolchain and the prebuilt OpenSSL and SQLite of beeware/cpython-android-source-deps), packages
+# it with the recipe's `package` step (the prefix/ layout the app's BuilderTools unpacks) and puts
+# it on this repository's "builder-tools" release, from where the app downloads it. The Android
+# workflow then pins its SHA-256 into the APK it builds.
+#
+# Run it once by hand (Actions, "The 32-bit builder's CPython", Run workflow), and again only when
+# the Python version changes.
+name: The 32-bit builder's CPython
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The CPython version to build (a tag of python/cpython)"
+        default: "v3.14.9"
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  HOST: arm-linux-androideabi
+
+jobs:
+  python:
+    name: CPython for ${{ env.HOST }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: The CPython source of that version
+        run: |
+          git clone --depth 1 --branch "${{ inputs.version || 'v3.14.9' }}" https://github.com/python/cpython
+          cd cpython && git rev-parse HEAD
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: The Android SDK the recipe asks for (it installs its own NDK)
+        run: |
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -Lf --retry 5 -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q tools.zip -d "$HOME/android-sdk/cmdline-tools"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+
+      - name: Configure and make (the build Python, then the host's)
+        run: |
+          cd cpython
+          python3 Android/android.py --verbose build $HOST
+
+      - name: Package
+        run: |
+          cd cpython
+          python3 Android/android.py package $HOST
+          TARBALL=$(ls cross-build/$HOST/dist/python-*.tar.gz)
+          cp "$TARBALL" "$RUNNER_TEMP/"
+
+      - name: Its SHA-256 and size, as the app's workflow pins them
+        id: hash
+        run: |
+          cd cpython
+          TARBALL=$(ls cross-build/$HOST/dist/python-*.tar.gz)
+          NAME=$(basename "$TARBALL")
+          SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$TARBALL")
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "$NAME: $SHA ($SIZE bytes)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpython-arm
+          path: ${{ runner.temp }}/python-*.tar.gz
+          retention-days: 7
+
+      - name: Onto the builder-tools release (where the app and the APK workflow take it from)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NAME="${{ steps.hash.outputs.name }}"
+          if gh release view builder-tools --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload builder-tools "$RUNNER_TEMP/$NAME" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            printf 'The 32-bit builder\u2019s tools (CPython for Android arm, PSF License Version; see THIRD_PARTY_NOTICES).' > notes.md
+            gh release create builder-tools "$RUNNER_TEMP/$NAME" --title "The builder's tools" --notes-file notes.md --prerelease --repo "$GITHUB_REPOSITORY"
+          fi

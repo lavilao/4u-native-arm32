@@ -27,6 +27,7 @@ import argparse
 import concurrent.futures as cf
 import hashlib
 import os
+import platform
 import shutil
 import struct
 import subprocess
@@ -40,10 +41,19 @@ DLL_GLUE = os.path.join(RUNTIME, "rc_dll.c")
 BASE_FLAGS = ["-c", "-fPIC", "-ffp-contract=off", "-frounding-math", "-fno-strict-aliasing", "-fwrapv", "-w",
               f"-I{RUNTIME}"]
 
-# ── Android (the arm64 app): the C library's headers are the few in runtime/android, and the
-# functions come from the device's libc.so and libm.so, which the library names as needed
-# through two empty stand-ins it is linked against. API 29 is the app's minSdk.
-ANDROID_TARGET = "aarch64-linux-android29"
+# ── Android (the arm64 app, and its armeabi-v7a build): the C library's headers are the few in
+# runtime/android, and the functions come from the device's libc.so and libm.so, which the library
+# names as needed through two empty stand-ins it is linked against. API 29 is the app's minSdk.
+#
+# Which of the two architectures a build targets: MH4N_ANDROID_ARCH (arm or arm64) when it is set
+# (a PC cross-building for a phone), else the machine the build runs on (the on-phone builder:
+# uname says armv7l/armv8l on a 32-bit phone, aarch64 on an arm64 one). The guest itself is 32-bit
+# ARM either way: the recompiled C is the same, only the compiler target and the checks below.
+ANDROID_ARCH = os.environ.get("MH4N_ANDROID_ARCH", "")
+if ANDROID_ARCH not in ("arm", "arm64"):
+    machine = platform.machine().lower()
+    ANDROID_ARCH = "arm64" if machine in ("aarch64", "arm64") else "arm"
+ANDROID_TARGET = "aarch64-linux-android29" if ANDROID_ARCH == "arm64" else "armv7a-linux-androideabi29"
 ANDROID_INCLUDE = os.path.join(RUNTIME, "android")
 ANDROID_SONAME = "libmh4u_code.so"
 ANDROID_PAGE = 16384  # Android 15's 16 KB pages; 4 KB devices load such a library too
@@ -78,7 +88,20 @@ def android_compiler(cc: str) -> str:
 
 
 def android_target_flags(cc: str) -> list[str]:
-    return ["-target", "aarch64-linux-android"] if is_zig(cc) else [f"--target={ANDROID_TARGET}"]
+    if not is_zig(cc):
+        return [f"--target={ANDROID_TARGET}"]
+    if ANDROID_ARCH == "arm64":
+        return ["-target", "aarch64-linux-android"]
+    # zig 0.13 has no armv7a triple: `arm` is the architecture, and its default for it predates
+    # ARMv7 (no ldrex/strex atomics). cortex_a7 (any ARMv7-A core runs its code: the A53 of a
+    # Helio G25 in 32-bit mode included) with NEON gives ARMv7-A + VFPv4 + Thumb-2 code. The float
+    # flags zig's own triple doesn't set: without them clang compiles the doubles to calls into
+    # soft-float routines (__aeabi_dadd); with them it uses the FPU, and the ABI stays softfp, the
+    # one every armeabi-v7a library uses. Zig links its compiler_rt even beside -nostdlib, so the
+    # u64 helpers of the host (an ARMv7 has no 64-bit divide, nor double conversions beyond 32
+    # bits) come along in the library instead of as imports.
+    return ["-target", "arm-linux-android", "-mcpu=cortex_a7+neon",
+            "-mfpu=neon-vfpv4", "-mfloat-abi=softfp"]
 
 
 def android_link_flags(cc: str, outdir: str, soname: str = ANDROID_SONAME) -> list[str]:
@@ -104,33 +127,56 @@ def android_link_flags(cc: str, outdir: str, soname: str = ANDROID_SONAME) -> li
 def android_library_problems(path: str, soname: str = ANDROID_SONAME) -> list[str]:
     """What would keep Android's linker from loading the library at `path` in the app (an empty
     list when nothing): another machine, no libc.so/libm.so needed, another soname, text
-    relocations, pages under 16 KB, or a function the device's C library doesn't have."""
+    relocations, pages under 16 KB, or a function the device's C library doesn't have.
+    The ELF is parsed for the architecture of this build: Elf64/AArch64 or Elf32/ARM (the
+    armeabi-v7a app)."""
+    arm64 = ANDROID_ARCH == "arm64"
+    want_class, want_machine, want_name = (2, 183, "64-bit ARM (AArch64)") if arm64 else (1, 40, "32-bit ARM")
     with open(path, "rb") as f:
         data = f.read()
-    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
-        return ["not a 64-bit little-endian ELF file"]
+    if data[:4] != b"\x7fELF" or data[4] != want_class or data[5] != 1:
+        return [f"not a {want_name} little-endian ELF file"]
     machine = struct.unpack_from("<H", data, 18)[0]
-    problems = [] if machine == 183 else [f"built for machine {machine}, not AArch64 (183)"]
-    e_phoff, e_shoff = struct.unpack_from("<QQ", data, 32)
-    e_phentsize, e_phnum, e_shentsize, e_shnum = struct.unpack_from("<HHHH", data, 54)
+    problems = [] if machine == want_machine else [f"built for machine {machine}, not {want_name} ({want_machine})"]
+    if arm64:
+        e_phoff, e_shoff = struct.unpack_from("<QQ", data, 32)
+        e_phentsize, e_phnum, e_shentsize, e_shnum = struct.unpack_from("<HHHH", data, 54)
+        phdr = lambda off: struct.unpack_from("<IIQQQQQQ", data, off)  # p_type, p_flags, p_offset, p_vaddr, ...
+        shdr = lambda off: struct.unpack_from("<IIQQQQIIQQ", data, off)
+        dynent = "<qQ"  # a dynamic entry's tag and value, 16 bytes
+        symbol = lambda off: struct.unpack_from("<IBBH", data, off)  # name, info, other, shndx (24-byte Elf64_Sym)
+        sym_size, ph_align_at, sh_offset, sh_link = 24, 7, 4, 6
+    else:
+        e_phoff, e_shoff = struct.unpack_from("<II", data, 28)
+        e_phentsize, e_phnum, e_shentsize, e_shnum = struct.unpack_from("<HHHH", data, 42)
+        phdr = lambda off: struct.unpack_from("<IIIIIIII", data, off)  # p_type, p_offset, p_vaddr, p_paddr, p_filesz, ...
+        shdr = lambda off: struct.unpack_from("<IIIIIIIIII", data, off)  # name, type, flags, addr, offset, size, link, ...
+        dynent = "<iI"  # a dynamic entry's tag and value, 8 bytes
+        def symbol(off):
+            name = struct.unpack_from("<I", data, off)[0]
+            info, _, shndx = struct.unpack_from("<BBH", data, off + 12)
+            return name, info, _, shndx
+        sym_size, ph_align_at, sh_offset, sh_link = 16, 7, 4, 6
     dynamic = None
     for i in range(e_phnum):
-        p_type, _, p_offset, p_vaddr, _, p_filesz, _, p_align = struct.unpack_from("<IIQQQQQQ", data, e_phoff + i * e_phentsize)
+        fields = phdr(e_phoff + i * e_phentsize)
+        p_type, p_align = fields[0], fields[ph_align_at]
+        p_offset, p_filesz = (fields[2], fields[5]) if arm64 else (fields[1], fields[4])
         if p_type == 1 and p_align < ANDROID_PAGE:
             problems.append(f"a segment aligned to {p_align} bytes, not {ANDROID_PAGE}")
         if p_type == 2:
             dynamic = (p_offset, p_filesz)
-    sections = [struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + i * e_shentsize) for i in range(e_shnum)]
+    sections = [shdr(e_shoff + i * e_shentsize) for i in range(e_shnum)]
     dynsym = next((s for s in sections if s[1] == 11), None)  # SHT_DYNSYM
     if dynamic is None or dynsym is None:
         return problems + ["no dynamic section: not a shared library"]
-    strtab = sections[dynsym[6]]
+    strtab = sections[dynsym[sh_link]]
     def text(offset: int) -> str:
-        start = strtab[4] + offset
+        start = strtab[sh_offset] + offset
         return data[start:data.index(b"\0", start)].decode("ascii", "replace")
     needed, found_soname, textrel = [], "", False
-    for off in range(dynamic[0], dynamic[0] + dynamic[1], 16):
-        tag, value = struct.unpack_from("<qQ", data, off)
+    for off in range(dynamic[0], dynamic[0] + dynamic[1], struct.calcsize(dynent)):
+        tag, value = struct.unpack_from(dynent, data, off)
         if tag == 0:
             break
         if tag == 1:
@@ -147,8 +193,8 @@ def android_library_problems(path: str, soname: str = ANDROID_SONAME) -> list[st
     if textrel:
         problems.append("it has text relocations")
     imports = set()
-    for off in range(dynsym[4], dynsym[4] + dynsym[5], 24):
-        name, info, _, shndx = struct.unpack_from("<IBBH", data, off)
+    for off in range(dynsym[4], dynsym[4] + dynsym[5], sym_size):
+        name, info, _, shndx = symbol(off)
         if name and shndx == 0 and (info >> 4) != 2:  # undefined, not weak
             imports.add(text(name))
     missing = sorted(imports - ANDROID_IMPORTS)
@@ -262,7 +308,8 @@ def main(argv=None) -> int:
     ap.add_argument("--deterministic", action="store_true",
                     help="with --native: keep charging cycles at every yield point "
                          "(RC_NATIVE_DETERMINISTIC)")
-    ap.add_argument("--android", action="store_true", help="the code library for Android's arm64 app")
+    ap.add_argument("--android", action="store_true",
+                    help=f"the code library for the Android app ({ANDROID_ARCH}: the machine it runs on, or MH4N_ANDROID_ARCH)")
     ap.add_argument("--cc", default="clang")
     ap.add_argument("-D", dest="defines", action="append", default=[])
     ap.add_argument("-o", "--lib", default="")

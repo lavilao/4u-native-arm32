@@ -73,6 +73,8 @@ void *linkernsbypass_namespace_dlopen(const char *filename, int flags, android_n
 #ifndef __NR_memfd_create
     #if defined(__aarch64__)
         #define __NR_memfd_create 279
+    #elif defined(__arm__) /* mh4n: the 32-bit ARM EABI number */
+        #define __NR_memfd_create 385
     #else
         #error Unsupported target architecture!
     #endif

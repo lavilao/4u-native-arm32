@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds SDL 3.4.18 for the app (arm64-v8a, Android 9 and later) from its release on GitHub, into build/sdl3/out.
+# Builds SDL 3.4.18 for the app (arm64-v8a, or $ANDROID_ABI, as the 32-bit build's armeabi-v7a;
+# Android 9 and later) from its release on GitHub, into build/sdl3/out-$ABI.
 # Run it once before scripts/build_apk.sh:
 #
 #   sh scripts/build_sdl3.sh
@@ -13,8 +14,8 @@ SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
 URL=https://github.com/libsdl-org/SDL/releases/download/release-$VERSION/SDL3-$VERSION.tar.gz
 WORK="$ROOT/build/sdl3"
 SRC="$WORK/SDL3-$VERSION"
-OUT="$WORK/out"
-if [ -f "$OUT/.built" ]; then echo "SDL3 $VERSION: already built in $OUT"; exit 0; fi
+OUT="$WORK/out-$ABI"
+if [ -f "$OUT/.built" ]; then echo "SDL3 $VERSION ($ABI): already built in $OUT"; exit 0; fi
 mkdir -p "$WORK"
 
 if [ ! -d "$SRC" ]; then
@@ -29,11 +30,11 @@ if [ ! -d "$SRC" ]; then
 fi
 
 S=$(native_path "$SRC")
-"$CMAKE" -S "$S" -B "$(native_path "$WORK/build")" -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" \
-    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+"$CMAKE" -S "$S" -B "$(native_path "$WORK/build-$ABI")" -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" \
+    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-28 \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_PREFIX="$(native_path "$OUT")" \
     -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
     -DCMAKE_C_FLAGS="-ffile-prefix-map=$S/=SDL3/" -DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384
-"$CMAKE" --build "$(native_path "$WORK/build")" --target install --parallel
+"$CMAKE" --build "$(native_path "$WORK/build-$ABI")" --target install --parallel
 touch "$OUT/.built"
-echo "SDL3 $VERSION: $OUT"
+echo "SDL3 $VERSION ($ABI): $OUT"

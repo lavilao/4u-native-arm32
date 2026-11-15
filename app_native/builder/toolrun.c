@@ -113,44 +113,67 @@ int main(int argc, char **argv) {
 
 #elif defined(TOOLRUN_ZIG)
 
-/* The kernel's sigaction for arm64 (bionic's wrapper refuses the signals it keeps for itself) */
+/* The kernel's sigaction (bionic's wrapper refuses the signals it keeps for itself): on arm64 all
+ * its fields are 64-bit; on arm the ABI is 4-byte fields and the kernel's 64-bit sigset as two
+ * words, twenty bytes with no padding (a uint64_t there would push the mask past where the
+ * kernel reads it). */
 struct ksigaction {
     void *handler;
     unsigned long flags;
     void *restorer;
+#if defined(__aarch64__)
     uint64_t mask;
+#else
+    unsigned long mask[2];
+#endif
 };
+#define KSIGSET_SIZE 8
 
 /* What bionic set up for this program that Zig's C library (musl) doesn't expect: its signal handlers (debuggerd's),
  * blocked signals and an alternate signal stack. */
 static void plain_signals(void) {
-    struct ksigaction dfl = {SIG_DFL, 0, NULL, 0};
+    struct ksigaction dfl = {SIG_DFL, 0, NULL};  /* (the mask: zero) */
     for (int s = 1; s <= 64; s++)
-        if (s != SIGKILL && s != SIGSTOP) syscall(SYS_rt_sigaction, s, &dfl, NULL, 8);
+        if (s != SIGKILL && s != SIGSTOP) syscall(SYS_rt_sigaction, s, &dfl, NULL, KSIGSET_SIZE);
     uint64_t none = 0;
-    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &none, NULL, 8);
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &none, NULL, KSIGSET_SIZE);
     stack_t ss = {.ss_sp = NULL, .ss_flags = SS_DISABLE, .ss_size = 0};
     sigaltstack(&ss, NULL);
 }
 
-/* Maps a static (ET_EXEC) AArch64 ELF program at its own addresses; returns its entry point and where its program
- * headers are in memory. */
-static uintptr_t load_elf(const char *path, Elf64_Ehdr *eh, uintptr_t *phdr_at) {
+/* Maps a static (ET_EXEC) ELF program at its own addresses; returns its entry point and where its program
+ * headers are in memory. Of the app's two builds: AArch64 loads an ELF64, ARM (armeabi-v7a) an ELF32
+ * (the ziglang wheel of that architecture). */
+#if defined(__aarch64__)
+typedef Elf64_Ehdr Elf_Ehdr;
+typedef Elf64_Phdr Elf_Phdr;
+#define ELF_CLASS_OK(eh) ((eh)->e_ident[EI_CLASS] == ELFCLASS64 && (eh)->e_machine == EM_AARCH64)
+#else
+typedef Elf32_Ehdr Elf_Ehdr;
+typedef Elf32_Phdr Elf_Phdr;
+#define ELF_CLASS_OK(eh) ((eh)->e_ident[EI_CLASS] == ELFCLASS32 && (eh)->e_machine == EM_ARM)
+#endif
+
+static uintptr_t load_elf(const char *path, Elf_Ehdr *eh, uintptr_t *phdr_at) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) die("open", path);
     if (pread(fd, eh, sizeof *eh, 0) != (ssize_t)sizeof *eh) die("read", path);
-    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_machine != EM_AARCH64)
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || !ELF_CLASS_OK(eh))
+#if defined(__aarch64__)
         die("not a 64-bit ARM program", path);
-    if (eh->e_type != ET_EXEC || eh->e_phentsize != sizeof(Elf64_Phdr) || eh->e_phnum == 0 || eh->e_phnum > 64)
+#else
+        die("not a 32-bit ARM program", path);
+#endif
+    if (eh->e_type != ET_EXEC || eh->e_phentsize != sizeof(Elf_Phdr) || eh->e_phnum == 0 || eh->e_phnum > 64)
         die("not a static program", path);
-    Elf64_Phdr ph[64];
-    size_t phsize = (size_t)eh->e_phnum * sizeof(Elf64_Phdr);
+    Elf_Phdr ph[64];
+    size_t phsize = (size_t)eh->e_phnum * sizeof(Elf_Phdr);
     if (pread(fd, ph, phsize, (off_t)eh->e_phoff) != (ssize_t)phsize) die("read", path);
     uintptr_t ps = (uintptr_t)sysconf(_SC_PAGESIZE);
     *phdr_at = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
-        const Elf64_Phdr *p = &ph[i];
-        if (p->p_type == PT_PHDR) *phdr_at = p->p_vaddr;
+        const Elf_Phdr *p = &ph[i];
+        if (p->p_type == PT_PHDR) *phdr_at = (uintptr_t)p->p_vaddr;
         if (p->p_type == PT_INTERP) die("not a static program", path);
         if (p->p_type != PT_LOAD || p->p_memsz == 0) continue;
         if ((p->p_vaddr - p->p_offset) % ps) die("a segment not aligned to the page size", path);
@@ -174,11 +197,11 @@ static uintptr_t load_elf(const char *path, Elf64_Ehdr *eh, uintptr_t *phdr_at) 
             if (m == MAP_FAILED || (uintptr_t)m != page_end) die("mmap (zeroed part)", path);
         }
         if (!*phdr_at && p->p_offset <= eh->e_phoff && eh->e_phoff + phsize <= p->p_offset + p->p_filesz)
-            *phdr_at = p->p_vaddr + (eh->e_phoff - p->p_offset);
+            *phdr_at = (uintptr_t)p->p_vaddr + (eh->e_phoff - p->p_offset);
     }
     close(fd);
     if (!*phdr_at) die("no program headers in memory", path);
-    return eh->e_entry;
+    return (uintptr_t)eh->e_entry;
 }
 
 static char *push(char **top, const void *data, size_t size) {
@@ -232,7 +255,7 @@ int main(int argc, char **argv) {
     int nenv = 0;
     while (environ[nenv]) nenv++;
 
-    Elf64_Ehdr eh;
+    Elf_Ehdr eh;
     uintptr_t phdr_at;
     uintptr_t entry = load_elf(zig, &eh, &phdr_at);
 
@@ -249,13 +272,18 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) sargv[nfront + i] = push(&top, argv[i], strlen(argv[i]) + 1);
     for (int i = 0; i < nenv; i++) senv[i] = push(&top, environ[i], strlen(environ[i]) + 1);
     char *execfn = push(&top, zig, strlen(zig) + 1);
+#if defined(__aarch64__)
     char *platform = push(&top, "aarch64", 8);
+#else
+    char *platform = push(&top, "armv7l", 7);
+#endif
     unsigned char rnd[16];
     if (getentropy(rnd, sizeof rnd) != 0) {
         for (size_t i = 0; i < sizeof rnd; i++) rnd[i] = (unsigned char)(i * 131 + (uintptr_t)&rnd);
     }
     char *random = push(&top, rnd, sizeof rnd);
 
+#if defined(__aarch64__)
     uint64_t aux[][2] = {
         {AT_PHDR, phdr_at}, {AT_PHENT, sizeof(Elf64_Phdr)}, {AT_PHNUM, eh.e_phnum}, {AT_PAGESZ, (uint64_t)sysconf(_SC_PAGESIZE)},
         {AT_BASE, 0}, {AT_FLAGS, 0}, {AT_ENTRY, entry}, {AT_UID, getuid()}, {AT_EUID, geteuid()}, {AT_GID, getgid()},
@@ -292,6 +320,48 @@ int main(int argc, char **argv) {
         : "r"(new_sp), "r"(new_pc)
         : "memory");
     __builtin_unreachable();
+#else
+    /* ARM (armeabi-v7a): the stack words and the auxiliary vector's pairs are 32-bit, as the
+     * kernel lays them out for a 32-bit program. The entry's low bit says ARM or Thumb; bx
+     * takes either. */
+    uint32_t aux[][2] = {
+        {AT_PHDR, (uint32_t)phdr_at}, {AT_PHENT, sizeof(Elf32_Phdr)}, {AT_PHNUM, eh.e_phnum},
+        {AT_PAGESZ, (uint32_t)sysconf(_SC_PAGESIZE)}, {AT_BASE, 0}, {AT_FLAGS, 0},
+        {AT_ENTRY, (uint32_t)entry}, {AT_UID, getuid()}, {AT_EUID, geteuid()}, {AT_GID, getgid()},
+        {AT_EGID, getegid()}, {AT_SECURE, 0}, {AT_RANDOM, (uint32_t)(uintptr_t)random},
+        {AT_HWCAP, (uint32_t)getauxval(AT_HWCAP)}, {AT_HWCAP2, (uint32_t)getauxval(AT_HWCAP2)},
+        {AT_CLKTCK, getauxval(AT_CLKTCK) ? (uint32_t)getauxval(AT_CLKTCK) : 100},
+        {AT_SYSINFO_EHDR, (uint32_t)getauxval(AT_SYSINFO_EHDR)}, {AT_PLATFORM, (uint32_t)(uintptr_t)platform},
+        {AT_EXECFN, (uint32_t)(uintptr_t)execfn}, {AT_NULL, 0},
+    };
+    size_t naux = sizeof aux / sizeof aux[0];
+    size_t words = 1 + (size_t)nargs + 1 + (size_t)nenv + 1 + 2 * naux;
+    uint32_t *sp = (uint32_t *)(((uintptr_t)top - words * 4) & ~(uintptr_t)7);
+    uint32_t *w = sp;
+    *w++ = (uint32_t)nargs;
+    for (int i = 0; i < nargs; i++) *w++ = (uint32_t)(uintptr_t)sargv[i];
+    *w++ = 0;
+    for (int i = 0; i < nenv; i++) *w++ = (uint32_t)(uintptr_t)senv[i];
+    *w++ = 0;
+    for (size_t i = 0; i < naux; i++) {
+        *w++ = aux[i][0];
+        *w++ = aux[i][1];
+    }
+
+    plain_signals();
+    register uint32_t new_sp __asm__("r1") = (uint32_t)(uintptr_t)sp;
+    register uint32_t new_pc __asm__("r2") = (uint32_t)entry;
+    __asm__ volatile(
+        "mov sp, r1\n"
+        "mov r0, #0\n"
+        "mov r1, #0\n"
+        "mov r12, #0\n"
+        "bx r2\n"
+        :
+        : "r"(new_sp), "r"(new_pc)
+        : "memory");
+    __builtin_unreachable();
+#endif
 }
 
 #else

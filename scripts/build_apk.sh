@@ -1,10 +1,11 @@
 #!/bin/sh
-# Builds the app's APK from this tree: libmain.so (app_native/ with the runtime in mh4n/), libadrenotools' hook
-# libraries and SDL3's library (scripts/build_sdl3.sh first), the code library id the app checks, the on-phone
-# builder's two launchers (libpyrun.so, libzigcc.so) and its tools (mh4n's tools/ and config/, zipped by
-# scripts/pack_builder_tools.py), then Gradle.
+# Builds the app's APK from this tree: libmain.so (app_native/ with the runtime in mh4n/, for arm64-v8a, or for
+# $ANDROID_ABI, as the 32-bit build's armeabi-v7a), libadrenotools' hook libraries and SDL3's library
+# (scripts/build_sdl3.sh first), the code library id the app checks, the on-phone builder's two launchers
+# (libpyrun.so, libzigcc.so) and its tools (mh4n's tools/ and config/, zipped by scripts/pack_builder_tools.py),
+# then Gradle.
 #
-#   sh scripts/build_apk.sh
+#   sh scripts/build_apk.sh              (or: ANDROID_ABI=armeabi-v7a sh scripts/build_apk.sh)
 #
 # The APK is android/app/build/outputs/apk/release/app-release.apk when android/keystore.properties (storePassword,
 # keyAlias, keyPassword) and android/mh4u.keystore hold your own signing key; without them it builds a debug APK
@@ -17,15 +18,15 @@
 set -e
 . "$(dirname "$0")/android_env.sh"
 
-SDL3_DIR="$ROOT/build/sdl3/out"
-[ -f "$SDL3_DIR/lib/libSDL3.so" ] || { echo "No SDL3 in $SDL3_DIR: run sh scripts/build_sdl3.sh first." >&2; exit 1; }
-BUILD="$ROOT/build/app"
+SDL3_DIR="$ROOT/build/sdl3/out-$ABI"
+[ -f "$SDL3_DIR/lib/libSDL3.so" ] || { echo "No SDL3 ($ABI) in $SDL3_DIR: run sh scripts/build_sdl3.sh first." >&2; exit 1; }
+BUILD="$ROOT/build/app-$ABI"
 R=$(native_path "$ROOT")
 N=$(native_path "$NDK")
 # (no paths of this computer in the libraries: sources as mh4n/..., app_native/...)
 MAP="-ffile-prefix-map=$R/= -ffile-prefix-map=$N/=ndk/"
 "$CMAKE" -S "$R/app_native" -B "$(native_path "$BUILD")" -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" \
-    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
+    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMH4N_DIR="$R/mh4n" -DSDL3_DIR="$(native_path "$SDL3_DIR")/lib/cmake/SDL3" \
     -DCMAKE_C_FLAGS="$MAP" -DCMAKE_CXX_FLAGS="$MAP" -DCMAKE_ASM_FLAGS="$MAP"
 HOOKS="hook_impl main_hook file_redirect_hook gsl_alloc_hook"
@@ -33,7 +34,7 @@ TOOLS="pyrun zigcc"   # (the on-phone builder's launchers: programs named lib*.s
 # shellcheck disable=SC2086
 "$CMAKE" --build "$(native_path "$BUILD")" --target main $HOOKS $TOOLS --parallel
 
-LIBS="$ROOT/android/app/src/main/jniLibs/arm64-v8a"
+LIBS="$ROOT/android/app/src/main/jniLibs/$ABI"
 mkdir -p "$LIBS"
 "$STRIP" --strip-debug -o "$(native_path "$LIBS/libmain.so")" "$(native_path "$BUILD/libmain.so")"
 for H in $HOOKS; do
