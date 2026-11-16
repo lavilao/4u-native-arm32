@@ -134,21 +134,26 @@ public class GameFolderActivity extends Activity {
         try (RandomAccessFile f = new RandomAccessFile(library, "r")) {
             byte[] h = new byte[64];
             f.readFully(h);
-            if (h[0] != 0x7F || h[1] != 'E' || h[2] != 'L' || h[3] != 'F' || h[4] != 2 || h[5] != 1) return "";
-            long shoff = le(h, 0x28, 8);
-            int shentsize = (int) le(h, 0x3A, 2), shnum = (int) le(h, 0x3C, 2);
-            if (shoff <= 0 || shentsize < 0x40 || shnum <= 0 || shnum > 4096) return "";
+            if (h[0] != 0x7F || h[1] != 'E' || h[2] != 'L' || h[3] != 'F' || h[5] != 1) return "";
+            boolean elf32 = h[4] == 1;
+            if (!elf32 && h[4] != 2) return "";
+            long shoff = le(h, elf32 ? 0x20 : 0x28, elf32 ? 4 : 8);
+            int shentsize = (int) le(h, elf32 ? 0x2E : 0x3A, 2), shnum = (int) le(h, elf32 ? 0x30 : 0x3C, 2);
+            int minShentsize = elf32 ? 40 : 0x40, symEntsize = elf32 ? 16 : 24;
+            if (shoff <= 0 || shentsize < minShentsize || shnum <= 0 || shnum > 4096) return "";
             byte[] sh = new byte[shentsize * shnum];
             f.seek(shoff);
             f.readFully(sh);
             for (int i = 0; i < shnum; i++) {
                 int at = i * shentsize;
-                if (le(sh, at + 4, 4) != 11) continue;  // SHT_DYNSYM
-                long symOff = le(sh, at + 0x18, 8), symSize = le(sh, at + 0x20, 8);
-                int link = (int) le(sh, at + 0x28, 4);
+                if (le(sh, at + 4, 4) != 11) continue;
+                long symOff = le(sh, at + (elf32 ? 16 : 0x18), elf32 ? 4 : 8);
+                long symSize = le(sh, at + (elf32 ? 20 : 0x20), elf32 ? 4 : 8);
+                int link = (int) le(sh, at + (elf32 ? 24 : 0x28), 4);
                 if (link >= shnum || symSize > (8 << 20)) return "";
                 int ls = link * shentsize;
-                long strOff = le(sh, ls + 0x18, 8), strSize = le(sh, ls + 0x20, 8);
+                long strOff = le(sh, ls + (elf32 ? 16 : 0x18), elf32 ? 4 : 8);
+                long strSize = le(sh, ls + (elf32 ? 20 : 0x20), elf32 ? 4 : 8);
                 if (strSize > (8 << 20)) return "";
                 byte[] syms = new byte[(int) symSize], strs = new byte[(int) strSize];
                 f.seek(symOff);
@@ -156,14 +161,17 @@ public class GameFolderActivity extends Activity {
                 f.seek(strOff);
                 f.readFully(strs);
                 byte[] want = "rc_library_id".getBytes(StandardCharsets.US_ASCII);
-                for (int k = 0; k + 24 <= syms.length; k += 24) {
-                    int name = (int) le(syms, k, 4), shndx = (int) le(syms, k + 6, 2);
+                for (int k = 0; k + symEntsize <= syms.length; k += symEntsize) {
+                    int name = (int) le(syms, k, 4);
+                    int shndx = (int) le(syms, k + (elf32 ? 14 : 6), 2);
                     if (name <= 0 || name + want.length >= strs.length || strs[name + want.length] != 0) continue;
                     boolean same = true;
                     for (int c = 0; c < want.length && same; c++) same = strs[name + c] == want[c];
                     if (!same || shndx <= 0 || shndx >= shnum) continue;
                     int ss = shndx * shentsize;
-                    long value = le(syms, k + 8, 8), secAddr = le(sh, ss + 0x10, 8), secOff = le(sh, ss + 0x18, 8);
+                    long value = le(syms, k + (elf32 ? 4 : 8), elf32 ? 4 : 8);
+                    long secAddr = le(sh, ss + (elf32 ? 12 : 0x10), elf32 ? 4 : 8);
+                    long secOff = le(sh, ss + (elf32 ? 16 : 0x18), elf32 ? 4 : 8);
                     byte[] id = new byte[64];
                     f.seek(secOff + (value - secAddr));
                     int n = f.read(id);
@@ -177,6 +185,19 @@ public class GameFolderActivity extends Activity {
             android.util.Log.w("MH4U", "code library id: " + e);
         }
         return "";
+    }
+
+    private static boolean looksLikeLibrary(File f) {
+        byte[] h = new byte[20];
+        try (RandomAccessFile r = new RandomAccessFile(f, "r")) {
+            r.readFully(h);
+        } catch (Exception e) {
+            return false;
+        }
+        boolean is64 = android.os.Process.is64Bit();
+        return h[0] == 0x7F && h[1] == 'E' && h[2] == 'L' && h[3] == 'F'
+                && h[4] == (is64 ? 2 : 1) && h[5] == 1
+                && (h[18] & 0xFF) == (is64 ? 183 : 40) && h[19] == 0;
     }
 
     private static long le(byte[] b, int at, int n) {
@@ -614,8 +635,8 @@ public class GameFolderActivity extends Activity {
                 wrong = es ? "Falta " + LIBRARY + " en esa carpeta. Créalo en este teléfono (Crear en este teléfono) o en una PC con la herramienta de la guía."
                            : LIBRARY + " is missing from that folder. Make it on this phone (Build on this phone) or on a PC with the guide's tool.";
             else if (!looksLikeLibrary(c[2]))
-                wrong = es ? LIBRARY + " no es una librería para Android (arm64). Créalo de nuevo en este teléfono o con la herramienta de la guía."
-                           : LIBRARY + " is not an Android (arm64) library. Make it again on this phone or with the guide's tool.";
+                wrong = es ? LIBRARY + " no es una librería de Android para la arquitectura de este teléfono. Créalo de nuevo en este teléfono o con la herramienta de la guía."
+                           : LIBRARY + " is not an Android library for this phone's architecture. Make it again on this phone or with the guide's tool.";
             else
                 wrong = libraryVersionProblem(c[2]);
             // (the game and its update are there, the library isn't usable: it can be made here)
@@ -654,8 +675,11 @@ public class GameFolderActivity extends Activity {
         } catch (Exception e) {
             return false;
         }
-        // an ELF file, 64-bit, for AArch64 (e_machine 183)
-        return h[0] == 0x7F && h[1] == 'E' && h[2] == 'L' && h[3] == 'F' && h[4] == 2 && (h[18] & 0xFF) == 183;
+        // Android loads only ELF class and machine types matching this process's ABI.
+        boolean is64 = android.os.Process.is64Bit();
+        return h[0] == 0x7F && h[1] == 'E' && h[2] == 'L' && h[3] == 'F'
+                && h[4] == (is64 ? 2 : 1) && h[5] == 1
+                && (h[18] & 0xFF) == (is64 ? 183 : 40) && h[19] == 0;
     }
 
     /**

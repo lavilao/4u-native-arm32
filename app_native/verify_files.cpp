@@ -567,42 +567,50 @@ bool blz(std::vector<uint8_t>& data) {
 }
 
 // The id a code library carries inside itself (rc_library_id, mh4n tools/game_version.py): read from its ELF symbol
-// table without loading it (GameFolderActivity.idInside); "" for one made before the tools wrote it
+// table without loading it (GameFolderActivity.idInside); "" for one made before the tools wrote it.
 std::string id_inside(const std::string& path) {
     File f;
     if (!f.open(path)) return "";
     uint8_t h[64];
-    if (!f.read_exact(0, h, 64) || memcmp(h, "\x7f" "ELF", 4) || h[4] != 2 || h[5] != 1) return "";
-    uint64_t shoff = le(h + 0x28, 8);
-    unsigned entsize = (unsigned)le(h + 0x3A, 2), num = (unsigned)le(h + 0x3C, 2);
-    if (!shoff || entsize < 0x40 || !num || num > 4096) return "";
+    if (!f.read_exact(0, h, 64) || memcmp(h, "\x7f" "ELF", 4) || h[5] != 1) return "";
+    const bool elf32 = h[4] == 1;
+    if (!elf32 && h[4] != 2) return "";
+    const unsigned word = elf32 ? 4 : 8, sym_ent = elf32 ? 16 : 24;
+    const uint64_t shoff = le(h + (elf32 ? 0x20 : 0x28), word);
+    const unsigned entsize = (unsigned)le(h + (elf32 ? 0x2e : 0x3a), 2);
+    const unsigned num = (unsigned)le(h + (elf32 ? 0x30 : 0x3c), 2);
+    if (!shoff || entsize < (elf32 ? 40 : 0x40) || !num || num > 4096) return "";
     std::vector<uint8_t> sh((size_t)entsize * num);
     if (!f.read_exact(shoff, sh.data(), sh.size())) return "";
     for (unsigned i = 0; i < num; i++) {
         const uint8_t* s = &sh[(size_t)i * entsize];
-        if (le(s + 4, 4) != 11) continue;  // SHT_DYNSYM
-        uint64_t sym_off = le(s + 0x18, 8), sym_size = le(s + 0x20, 8);
-        unsigned link = (unsigned)le(s + 0x28, 4);
+        if (le(s + 4, 4) != 11) continue;
+        const uint64_t sym_off = le(s + (elf32 ? 16 : 0x18), word);
+        const uint64_t sym_size = le(s + (elf32 ? 20 : 0x20), word);
+        const unsigned link = (unsigned)le(s + (elf32 ? 24 : 0x28), 4);
         if (link >= num || sym_size > (8u << 20)) return "";
         const uint8_t* l = &sh[(size_t)link * entsize];
-        uint64_t str_off = le(l + 0x18, 8), str_size = le(l + 0x20, 8);
+        const uint64_t str_off = le(l + (elf32 ? 16 : 0x18), word);
+        const uint64_t str_size = le(l + (elf32 ? 20 : 0x20), word);
         if (str_size > (8u << 20)) return "";
-        std::vector<uint8_t> syms(sym_size), strs(str_size);
+        std::vector<uint8_t> syms((size_t)sym_size), strs((size_t)str_size);
         if (!f.read_exact(sym_off, syms.data(), syms.size()) || !f.read_exact(str_off, strs.data(), strs.size())) return "";
         static const char want[] = "rc_library_id";
-        for (size_t k = 0; k + 24 <= syms.size(); k += 24) {
-            uint64_t name = le(&syms[k], 4), shndx = le(&syms[k + 6], 2);
+        for (size_t k = 0; k + sym_ent <= syms.size(); k += sym_ent) {
+            const uint64_t name = le(&syms[k], 4), shndx = le(&syms[k + (elf32 ? 14 : 6)], 2);
             if (!name || name + sizeof want > strs.size() || memcmp(&strs[name], want, sizeof want)) continue;
             if (!shndx || shndx >= num) continue;
-            const uint8_t* ss = &sh[(size_t)shndx * entsize];
-            uint64_t value = le(&syms[k + 8], 8), addr = le(ss + 0x10, 8), off = le(ss + 0x18, 8);
+            const uint8_t* section = &sh[(size_t)shndx * entsize];
+            const uint64_t value = le(&syms[k + (elf32 ? 4 : 8)], word);
+            const uint64_t addr = le(section + (elf32 ? 12 : 0x10), word);
+            const uint64_t off = le(section + (elf32 ? 16 : 0x18), word);
             char id[65] = {};
-            int64_t got = f.read(off + (value - addr), id, 64);
+            const int64_t got = f.read(off + (value - addr), id, 64);
             if (got <= 0) return "";
             id[got] = 0;
-            std::string s = id;
-            while (!s.empty() && (s.back() == ' ' || s.back() == '\n')) s.pop_back();
-            return s;
+            std::string result = id;
+            while (!result.empty() && (result.back() == ' ' || result.back() == '\n')) result.pop_back();
+            return result;
         }
         return "";
     }
@@ -1096,7 +1104,7 @@ void run() {
             todo_choose_again(r);
         }
     }
-    // ---- the code library: an arm64 ELF, its id inside and beside it, this app's
+    // ---- the code library: an Android ELF for this ABI, its id inside and beside it, this app's
     if (!folder.empty() && is_dir(folder)) {
         if (library.empty()) {
 #ifdef _WIN32  // (MH4U for PC's)
@@ -1120,8 +1128,15 @@ void run() {
             const std::string inside;
 #endif
             const std::string beside = first_line(library.substr(0, library.size() - 4) + ".id");
+#else  // (Android: an ELF for this build's own ABI: arm64-v8a, or armeabi-v7a on the 32-bit phones)
+            bool elf = lf.open(library) && lf.read_exact(0, h, 20) && !memcmp(h, "\x7f" "ELF", 4) && h[5] == 1;
+#if defined(__aarch64__)
+            elf = elf && h[4] == 2 && h[18] == 183 && h[19] == 0;
+#elif defined(__arm__)
+            elf = elf && h[4] == 1 && h[18] == 40 && h[19] == 0;
 #else
-            bool elf = lf.open(library) && lf.read_exact(0, h, 20) && !memcmp(h, "\x7f" "ELF", 4) && h[4] == 2 && h[18] == 183;
+            elf = false;
+#endif
             lf.close();
             const std::string beside = first_line(library.substr(0, library.size() - 3) + ".id"), inside = elf ? id_inside(library) : "";
 #endif
@@ -1130,7 +1145,8 @@ void run() {
 #ifdef _WIN32
                 r.problem(F("%s is not a Windows (x64) library.", name.c_str()), F("%s no es una librería para Windows (x64).", name.c_str()));
 #else
-                r.problem(F("%s is not an Android (arm64) library.", name.c_str()), F("%s no es una librería para Android (arm64).", name.c_str()));
+                r.problem(F("%s is not an Android library for this phone's architecture.", name.c_str()),
+                          F("%s no es una librería de Android para la arquitectura de este teléfono.", name.c_str()));
 #endif
                 todo_library(r);
             } else if (!inside.empty() && !beside.empty() && inside != beside) {

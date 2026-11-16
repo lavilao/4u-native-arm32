@@ -34,7 +34,8 @@ is the host's side:
   the library check reads the ELF as Elf32/ARM, and Zig's compiler_rt rides along beside
   `-nostdlib`, so the u64 helpers of the host (`__aeabi_uldivmod` and friends) are in the library
   instead of imports. The phone's own architecture is picked from `uname` (a PC cross-building can
-  set `MH4N_ANDROID_ARCH=arm`).
+  `MH4N_ANDROID_ARCH=arm`). The Android app and its game-folder check accept this ELF32/ARM library on a 32-bit
+  build; the 64-bit app continues to require ELF64/AArch64.
 - **The builder's launchers** (`app_native/builder/toolrun.c`): the loader that runs Zig's static
   program in the app's address space reads a 32-bit ARM ELF, lays out the stack and the auxiliary
   vector with 32-bit words, and enters in ARM or Thumb mode as the entry says.
