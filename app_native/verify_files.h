@@ -8,7 +8,7 @@
 //     hashed); for the USA game and update, their superblocks against the original dumps' (a copy rebuilt with hashes of
 //     its own: a modified repack)
 //   - the app's copy of the update's code (files/game: Dump.java) and the files it was made from (source.txt)
-//   - the code library: an arm64 ELF, the id inside it, the .id beside it and the app's wanted id, the same build; the
+//   - the code library: an ELF for this phone's ABI, the id inside it, the .id beside it and the app's wanted id, the same build; the
 //     game's code with the code mods that are on against the library the game runs (mh4n mods::CheckCode)
 //   - the save and its extra data (guild cards, event quests, the Palico), the code mods that clash, the mods on
 // The report goes to the log too ("[verify] ..." lines, every file named), for Share log.

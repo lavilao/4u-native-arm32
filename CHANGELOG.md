@@ -30,6 +30,7 @@ line says "should", please tell us how it goes on yours (the Discord or an issue
   with this release's own APK) and
   about 92 minutes on a Galaxy S25 Ultra that paused 72 times for heat; both made the same library, and the game runs Val
   Habar at 60 FPS with it. It should take about 2 hours on a low-end phone. Klark231's idea.
+- **32-bit ARM game libraries:** the game-folder check and file verifier now accept the ELF32/ARM library built for a 32-bit APK, rather than rejecting it as non-arm64.
 - **Single-screen mode of our own:** the touch screen's menus drawn on the top screen by the game itself, in every
   language, Spanish included: the title menu, quest counters and lists, the canteen, shops, Palico menus, help pages and
   yes / no questions. On by default, also when you update (gear, **Graphics & Audio**, **Screen and HUD**); with the USA
@@ -346,6 +347,7 @@ línea dice "debería", cuéntanos cómo te va en el tuyo (en el Discord o en un
   Ultra que paró 72 veces por calor;
   los dos crearon la misma librería, y con ella el juego anda en Val Habar a 60 FPS. En un teléfono de gama baja debería
   tardar unas 2 horas. Idea de Klark231.
+- **Librerías de juego ARM de 32 bits:** la comprobación de la carpeta del juego y la de archivos aceptan la librería ELF32/ARM de una APK de 32 bits, en vez de rechazarla por no ser arm64.
 - **Un modo de pantalla única propio:** los menús de la pantalla táctil dibujados en la de arriba por el propio juego, en
   todos los idiomas, español incluido: el menú de título, los mostradores y listas de misiones, la cantina, las tiendas, los
   menús de los Felyne, las páginas de ayuda y las preguntas de sí o no. Activado por defecto, también al actualizar
