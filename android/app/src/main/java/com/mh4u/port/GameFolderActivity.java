@@ -187,19 +187,6 @@ public class GameFolderActivity extends Activity {
         return "";
     }
 
-    private static boolean looksLikeLibrary(File f) {
-        byte[] h = new byte[20];
-        try (RandomAccessFile r = new RandomAccessFile(f, "r")) {
-            r.readFully(h);
-        } catch (Exception e) {
-            return false;
-        }
-        boolean is64 = android.os.Process.is64Bit();
-        return h[0] == 0x7F && h[1] == 'E' && h[2] == 'L' && h[3] == 'F'
-                && h[4] == (is64 ? 2 : 1) && h[5] == 1
-                && (h[18] & 0xFF) == (is64 ? 183 : 40) && h[19] == 0;
-    }
-
     private static long le(byte[] b, int at, int n) {
         long v = 0;
         for (int i = n - 1; i >= 0; i--) v = v << 8 | (b[at + i] & 0xFFL);
