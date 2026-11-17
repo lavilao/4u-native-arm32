@@ -31,6 +31,7 @@ line says "should", please tell us how it goes on yours (the Discord or an issue
   about 92 minutes on a Galaxy S25 Ultra that paused 72 times for heat; both made the same library, and the game runs Val
   Habar at 60 FPS with it. It should take about 2 hours on a low-end phone. Klark231's idea.
 - **32-bit ARM game libraries:** the game-folder check and file verifier now accept the ELF32/ARM library built for a 32-bit APK, rather than rejecting it as non-arm64.
+- **Decrypted dumps whose header doesn't say so:** some dumpers (and a dump made with a zero key) leave the NoCrypto bit clear on a copy that is in the clear, and the app called it encrypted. The game folder, the runtime and the file verifier now ask the content itself: the RomFS section opens with its IVFC hash tree, which ciphertext never has. A file that really is encrypted is still refused, with the same message.
 - **Single-screen mode of our own:** the touch screen's menus drawn on the top screen by the game itself, in every
   language, Spanish included: the title menu, quest counters and lists, the canteen, shops, Palico menus, help pages and
   yes / no questions. On by default, also when you update (gear, **Graphics & Audio**, **Screen and HUD**); with the USA
@@ -348,6 +349,7 @@ línea dice "debería", cuéntanos cómo te va en el tuyo (en el Discord o en un
   los dos crearon la misma librería, y con ella el juego anda en Val Habar a 60 FPS. En un teléfono de gama baja debería
   tardar unas 2 horas. Idea de Klark231.
 - **Librerías de juego ARM de 32 bits:** la comprobación de la carpeta del juego y la de archivos aceptan la librería ELF32/ARM de una APK de 32 bits, en vez de rechazarla por no ser arm64.
+- **Copias descifradas cuyo encabezado no lo dice:** algunos volcadores (y una copia hecha con clave cero) dejan el bit NoCrypto apagado en una copia que sí está en claro, y la app la llamaba cifrada. La carpeta del juego, el runtime y la verificación de archivos ahora le preguntan al contenido: la sección RomFS empieza con su árbol de hashes IVFC, que un texto cifrado nunca tiene. Un archivo que de verdad está cifrado se sigue rechazando, con el mismo mensaje.
 - **Un modo de pantalla única propio:** los menús de la pantalla táctil dibujados en la de arriba por el propio juego, en
   todos los idiomas, español incluido: el menú de título, los mostradores y listas de misiones, la cantina, las tiendas, los
   menús de los Felyne, las páginas de ayuda y las preguntas de sí o no. Activado por defecto, también al actualizar

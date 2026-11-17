@@ -75,7 +75,24 @@ final class Dump {
         n.romfsOffset = le32(h, 0x1B0) * unit;
         n.romfsSize = le32(h, 0x1B4) * unit;
         n.noCrypto = (h[0x188 + 7] & 0x04) != 0;
+        if (!n.noCrypto) n.noCrypto = romfsPlain(f, n);
         return n;
+    }
+
+    /**
+     * Whether the content is in the clear, for a dump that left the NoCrypto bit clear (some dumpers don't set
+     * it, and a dump with a zero key has it clear): the flag is not the file. The RomFS section always opens
+     * with its IVFC hash tree, and ciphertext does not say "IVFC". The runtime asks the content the same way
+     * (dump_source.cpp).
+     */
+    private boolean romfsPlain(RandomAccessFile f, Ncch n) {
+        if (n.romfsOffset <= 0 || n.romfsSize < 0x1000) return false;
+        try {
+            byte[] m = read(f, n.base + n.romfsOffset, 4);
+            return m[0] == 'I' && m[1] == 'V' && m[2] == 'F' && m[3] == 'C';
+        } catch (Problem e) {
+            return false;
+        }
     }
 
     /** The game's NCCH: an NCSD's partition 0, a CIA's content 0, or an NCCH at 0. */
@@ -105,12 +122,11 @@ final class Dump {
             long pos = contentOff;
             for (int i = 0; i < count && chunks + i * 0x30 + 0x10 <= tmd.length; i++) {
                 int c = chunks + i * 0x30;
-                int index = be16(tmd, c + 4), type = be16(tmd, c + 6);
+                int index = be16(tmd, c + 4);
                 long size = be64(tmd, c + 8);
                 if (index == 0) {
-                    if ((type & 1) != 0)
-                        throw new Problem(t("El .cia está cifrado: tiene que ser una copia descifrada, la tuya.",
-                                            "The .cia is encrypted: it has to be a decrypted copy of your own."));
+                    // (the TMD's encrypted bit is no more the last word than the NCCH's flag: a zero-key dump is
+                    // plain with the bit set. ncchAt asks the content, and prepare says it is encrypted.)
                     Ncch n = ncchAt(f, pos);
                     n.cia = true;
                     n.ciaTitleId = titleId;

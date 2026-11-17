@@ -64,6 +64,16 @@ bool ParseNcch(const PositionedFile& f, u64 base, Ncch* n, std::string* error) {
     n->romfs_offset = Le32(h.data() + 0x1B0) * unit;
     n->romfs_size = Le32(h.data() + 0x1B4) * unit;
     n->no_crypto = (flags[7] & 0x04) != 0;
+    if (!n->no_crypto) {
+        // Some dumpers (and a dump with a zero key) leave the NoCrypto bit clear on content that is plain:
+        // the flag is not the file. The RomFS section always opens with its IVFC hash tree, and ciphertext
+        // does not say "IVFC", so the content itself is asked.
+        std::vector<u8> magic;
+        if (n->romfs_size >= 0x1000 && Read(f, base + n->romfs_offset, 4, &magic, nullptr) &&
+            std::memcmp(magic.data(), "IVFC", 4) == 0) {
+            n->no_crypto = true;
+        }
+    }
     return true;
 }
 
@@ -113,13 +123,11 @@ bool FindNcch(const PositionedFile& f, Ncch* out, std::string* error) {
         u64 pos = content_off;
         for (u32 i = 0; i < count && chunks + i * 0x30 + 0x10 <= tmd.size(); ++i) {
             const u8* c = tmd.data() + chunks + i * 0x30;
-            const u16 index = Be16(c + 4), type = Be16(c + 6);
+            const u16 index = Be16(c + 4);
             const u64 size = Be64(c + 8);
             if (index == 0) {
-                if (type & 1) {
-                    if (error) *error = "the .cia is encrypted: it has to be a decrypted copy of your own";
-                    return false;
-                }
+                // (the TMD's encrypted bit is no more the last word than the NCCH's flag: a zero-key dump is
+                // plain with the bit set. ParseNcch asks the content, and the callers say it is encrypted.)
                 if (!ParseNcch(f, pos, out, error)) return false;
                 out->cia_title_id = title_id;
                 out->cia_title_version = version;
