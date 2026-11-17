@@ -445,6 +445,7 @@ line says "should", please tell us how it goes on yours (the Discord or an issue
   about 92 minutes on a Galaxy S25 Ultra that paused 72 times for heat; both made the same library, and the game runs Val
   Habar at 60 FPS with it. It should take about 2 hours on a low-end phone. Klark231's idea.
 - **32-bit ARM game libraries:** the game-folder check and file verifier now accept the ELF32/ARM library built for a 32-bit APK, rather than rejecting it as non-arm64.
+- **32-bit ARM custom GPU-driver bypass:** the linker-namespace bypass stays disabled on arm32 because its ARM64 `dlopen` scan cannot safely resolve Android's 32-bit compact PLT trampoline. The app falls back to the system Vulkan driver; custom GPU-driver hooks remain unavailable on arm32.
 - **Decrypted dumps whose header doesn't say so:** some dumpers (and a dump made with a zero key) leave the NoCrypto bit clear on a copy that is in the clear, and the app called it encrypted. The game folder, the runtime and the file verifier now ask the content itself: the RomFS section opens with its IVFC hash tree, which ciphertext never has. A file that really is encrypted is still refused, with the same message.
 - **Single-screen mode of our own:** the touch screen's menus drawn on the top screen by the game itself, in every
   language, Spanish included: the title menu, quest counters and lists, the canteen, shops, Palico menus, help pages and
