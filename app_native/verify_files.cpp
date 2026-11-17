@@ -463,6 +463,13 @@ bool ncch_at(const File& f, uint64_t base, Ncch& n) {
     n.exefs_off = le(n.h + 0x1A0, 4) * n.unit, n.exefs_size = le(n.h + 0x1A4, 4) * n.unit, n.exefs_hash = le(n.h + 0x1A8, 4) * n.unit;
     n.romfs_off = le(n.h + 0x1B0, 4) * n.unit, n.romfs_size = le(n.h + 0x1B4, 4) * n.unit, n.romfs_hash = le(n.h + 0x1B8, 4) * n.unit;
     n.plain = (n.h[0x188 + 7] & 0x04) != 0;
+    if (!n.plain) {
+        // Some dumpers (and a dump with a zero key) leave the NoCrypto bit clear on content that is plain: the
+        // flag is not the file. The RomFS section always opens with its IVFC hash tree, and ciphertext does not
+        // say "IVFC", so the content itself is asked (dump_source.cpp, the runtime, asks it the same way).
+        uint8_t magic[4];
+        n.plain = n.romfs_size >= 0x1000 && f.read_exact(n.base + n.romfs_off, magic, 4) && !memcmp(magic, "IVFC", 4);
+    }
     return true;
 }
 
@@ -512,14 +519,11 @@ bool find_ncch(const File& f, Ncch& n) {
         uint64_t pos = content;
         for (int i = 0; i < count && chunks + i * 0x30 + 0x10 <= tmd.size(); i++) {
             size_t c = chunks + i * 0x30;
-            int index = (int)be(&tmd[c + 4], 2), type = (int)be(&tmd[c + 6], 2);
+            int index = (int)be(&tmd[c + 4], 2);
             uint64_t size = be(&tmd[c + 8], 8);
             if (index == 0) {
-                if (type & 1) {
-                    n.err_en = "the .cia is encrypted: it has to be a decrypted copy of your own";
-                    n.err_es = "el .cia está cifrado: tiene que ser una copia descifrada, la tuya";
-                    return false;
-                }
+                // (the TMD's encrypted bit is no more the last word than the NCCH's flag: a zero-key dump is
+                // plain with the bit set. ncch_at asks the content, and quick says it is encrypted.)
                 if (!ncch_at(f, pos, n)) return false;
                 n.cia = true, n.cia_title = title, n.cia_version = version;
                 return true;
