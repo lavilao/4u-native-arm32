@@ -49,7 +49,6 @@ jobs:
 
       # The 32-bit builder's CPython: pinned by hash into the APK for BuilderTools to check
       - name: The 32-bit builder's CPython, its SHA-256 pinned into the APK
-        if: matrix.abi == 'armeabi-v7a'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
