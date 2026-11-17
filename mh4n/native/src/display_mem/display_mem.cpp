@@ -611,6 +611,21 @@ std::unique_ptr<gpu::Gpu> MakeDisplayMem(gpu::Host& host, const Options& options
     return std::make_unique<DisplayMemGpu>(host, (*null_factory)(host, options));
 }
 
+// The alternative renderer (gpu/gles) with its screens shown the same way. It is the GX commands' and the screens'
+// plumbing only so far: its own picture comes when the drawing lands on it (gles_gpu.h).
+std::unique_ptr<gpu::Gpu> MakeGlesDisplay(gpu::Host& host, const Options& options) {
+    const gpu::GpuFactory* gles_factory = Registry<gpu::GpuFactory>::Instance().Find("gles");
+    if (gles_factory == nullptr) {
+        MH4N_LOG(Error, kLog, "the gles GPU is not registered");
+        return nullptr;
+    }
+    std::unique_ptr<gpu::Gpu> inner = (*gles_factory)(host, options);
+    if (inner == nullptr) {
+        return nullptr;
+    }
+    return std::make_unique<DisplayMemGpu>(host, std::move(inner));
+}
+
 // The native renderer (gpu/native) with its screens shown from guest memory: it writes every target
 // back before a display transfer, so at VBlank the framebuffers hold what it drew. Its GX engine
 // starts with zeroed registers, so they are seeded with the values the null GPU starts with
@@ -700,6 +715,9 @@ MH4N_OPTION("runner", "--render-queue", "N",
 MH4N_OPTION("runner", "--render-thread", "on|off",
             "--gpu native-display: run the renderer on a thread of its own (default off; MH4N_RENDER_THREAD=1 too)");
 MH4N_REGISTER(present::DisplayGpu, "native-display", {});
+// The alternative renderer on GLES (gpu/gles): chosen with `[Graphics] Renderer = gles` in mh4u-app.ini (android_main.cpp).
+MH4N_REGISTER(gpu::GpuFactory, "gles-display", MakeGlesDisplay);
+MH4N_REGISTER(present::DisplayGpu, "gles-display", {});
 MH4N_REGISTER(BootStep, "display_mem.attach", BootStep{Phase::Services, AttachStep});
 
 }  // namespace mh4n::display_mem

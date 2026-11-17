@@ -665,6 +665,7 @@ int main(int argc, char* argv[]) {
         }
         // the settings that apply at start (mh4u-app.ini): the sound's volume, the 3D resolution, the renderer's thread
         std::string render_thread = "on";
+        std::string renderer = "vulkan";  // [Graphics] Renderer: vulkan (gpu/native) or gles (gpu/gles, the alternative)
         int render_percent = kRenderScaleDefault;  // (the phone's own resolution unless the player chose less)
         app_set_window_size(screen_w, screen_h);
         {
@@ -687,6 +688,11 @@ int main(int argc, char* argv[]) {
                 }
                 if (section == "Graphics" && key == "RenderThread") {  // the renderer on a thread of its own (on|off)
                     render_thread = value == "off" ? "off" : "on";
+                }
+                if (section == "Graphics" && key == "Renderer") {
+                    // (vulkan, the renderer on the phone's Vulkan driver; gles, the alternative one on its own GLES 3
+                    // context: gpu/gles, for a Vulkan driver that misdraws the game's draws)
+                    renderer = value;
                 }
             }
         }
@@ -750,6 +756,19 @@ int main(int argc, char* argv[]) {
         // the renderer's thread joins the performance-hint session as the game's does (it carries the frame as much;
         // PERF_SUBMIT would join only after reporting frame after frame)
         mh4n::gpu::queue::SetRendererThreadStartHook([] { perf_hint_thread(PERF_GAME); });
+        // The renderer: the phone's Vulkan driver (the default) or the alternative GLES path (gpu/gles)
+        const bool gles_renderer = renderer == "gles" || renderer == "GLES" || renderer == "gles3" ||
+                                   renderer == "GLES3" || renderer == "gl" || renderer == "opengl";
+        if (gles_renderer) {
+            for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+                if (args[i] == "--gpu") {
+                    args[i + 1] = "gles-display";
+                }
+            }
+            Logf("renderer: GLES (gpu/gles), an OpenGL ES context of its own, not the Vulkan driver");
+        } else if (renderer != "vulkan" && renderer != "Vulkan") {
+            Logf("renderer: \"" + renderer + "\" is not one: Vulkan is used (vulkan|gles)");
+        }
         if (launch.count("args")) {
             std::istringstream extra(launch["args"]);
             std::string a;
