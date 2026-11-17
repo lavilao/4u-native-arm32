@@ -40,6 +40,12 @@ option(MH4N_ASAN "Build with AddressSanitizer" OFF)
 option(MH4N_DEBUG_GUARD "Guest memory debug guard (N1-02)" OFF)
 option(MH4N_APP "Build the app tree native/app (SDL3, Dear ImGui: mh4u-native, N2b-03)" OFF)
 
+# A 32-bit off_t stops at 2 GiB: on armeabi-v7a every read of the game's RomFS past 2 GiB failed on the host
+# (the game then ran on the bytes it got and crashed). off_t is 64-bit with this, on Android and glibc alike.
+if (CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT WIN32)
+    add_compile_definitions(_FILE_OFFSET_BITS=64)
+endif()
+
 # Programs go to <build>/bin.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
