@@ -1,11 +1,8 @@
-# The app's APKs: the arm64-v8a one as upstream builds it, and the armeabi-v7a one of this fork
-# (the 32-bit phones the port runs on: a 1 GiB guest memory instead of the 4 GiB reservation, ARM
-# fibers, the builder's tools of that architecture). The 32-bit APK pins the SHA-256 of the 32-bit
-# builder's CPython (the builder-tools release, made by "The 32-bit builder's CPython" workflow)
-# into its assets, where BuilderTools reads it.
-#
-# Both are signed with android/mh4u.keystore, so one build replaces the last without touching the
-# game folder or the saves. Without a game dump nothing here contains game data.
+# The 32-bit APK for the Redmi 9A and other armv7 phones. This project targets armeabi-v7a only.
+# The 32-bit APK pins the SHA-256 of the 32-bit builder's CPython (the builder-tools release,
+# made by "The 32-bit builder's CPython" workflow) into its assets, where BuilderTools reads it.
+# Without a game dump nothing here contains game data.
+
 name: The Android APKs
 
 on:
@@ -18,15 +15,11 @@ permissions:
 
 jobs:
   apk:
-    name: The ${{ matrix.abi }} APK
+    name: The armeabi-v7a APK
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        abi: [arm64-v8a, armeabi-v7a]
     env:
-      ANDROID_ABI: ${{ matrix.abi }}
+      ANDROID_ABI: armeabi-v7a
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -93,12 +86,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ matrix.abi }}
+          name: apk-armeabi-v7a
           path: MH4U-32bit-port-*.apk
           retention-days: 30
 
       - name: Onto the builder-tools release, beside the CPython
-        if: matrix.abi == 'armeabi-v7a' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

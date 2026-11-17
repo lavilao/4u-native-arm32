@@ -8,12 +8,12 @@ ANDROID_ABI=armeabi-v7a sh scripts/build_sdl3.sh
 ANDROID_ABI=armeabi-v7a sh scripts/build_apk.sh
 ```
 
-or take the APK from this repository's Actions ("The Android APKs"), which builds both arm64-v8a
-and armeabi-v7a. The on-phone builder works there too: run "The 32-bit builder's CPython" once
-(first time only), which builds CPython for Android's arm with python.org's own recipe (python.org
-publishes Android builds for aarch64 and x86_64 only) and puts it on the `builder-tools` release;
-the APK workflow pins its SHA-256 into the APK. Zig's armv7l wheel (PyPI, static musl: it runs on
-Android as the aarch64 one does) needs no such step.
+Run "The Android APKs" GitHub Actions workflow to build the armeabi-v7a APK. The on-phone builder
+works there too: run "The 32-bit builder's CPython" once (first time only), which builds CPython
+for Android's arm with python.org's own recipe (python.org publishes Android builds for aarch64
+and x86_64 only) and puts it on the `builder-tools` release; the APK workflow pins its SHA-256 into
+the APK. Zig's armv7l wheel (PyPI, static musl: it runs on Android as the aarch64 one does) needs
+no such step.
 
 ## What differs from the arm64 build
 
