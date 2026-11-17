@@ -156,6 +156,9 @@ constexpr int TB = sizeof TOUCH_BUTTONS / sizeof *TOUCH_BUTTONS;
 const char* const BUTTON_KEYS[] = {"off", "ZR", "ZL", "R", "L", "X", "Y"};
 const char* const END_KEYS[] = {"ZL+ZR", "L+R", "off"};
 
+// [Graphics] Renderer (mh4u-app.ini): the phone's Vulkan driver, or the alternative GLES path (gpu/gles)
+const char* const RENDERER_KEYS[] = {"vulkan", "gles"};
+
 struct Draft {
     // mh4u.ini (game_options.h), as the file has them
     std::string fps, steady, widescreen, hud_edges, bloom, motion_blur, depth_of_field, radial_blur, haze, dither, antialiasing, fov;
@@ -166,6 +169,7 @@ struct Draft {
     std::string effects;  // (effects: the game's particle effects, mh4n hooks.cpp EffectsApply)
     // mh4u-app.ini (app_settings.h)
     int scale = kRenderScaleDefault, volume = 100;  // scale: the 3D resolution, % of the phone's (0: the 3DS's)
+    int renderer = 0;  // [Graphics] Renderer: RENDERER_KEYS' index (Vulkan, or the alternative GLES path)
     int low_end = LOW_END_OFF;
     bool stats = false, shadows = true, reverb = true;
     bool adreno_fix = true;  // [Graphics] AdrenoFix: auto (first_run.h adreno_fix_applies; its row shows only there)
@@ -785,6 +789,7 @@ Draft load() {
     d.rewards_send_all = game_option_get("rewards_send_all", f.rewards_send_all);
     d.effects = game_option_get("effects", f.effects);
     d.scale = std::clamp(app_setting_int("Graphics", "RenderScale", kRenderScaleDefault), 0, 100);
+    d.renderer = std::max(0, index_of(RENDERER_KEYS, app_setting("Graphics", "Renderer", "vulkan")));
     d.adreno_fix = app_adreno_fix();
     d.dither = game_option_get("dither", render_scale_used(d.scale, d.adreno_fix) > 1 ? "off" : "on");  // (android_main.cpp)
     d.low_end = app_low_end_level(app_setting("Graphics", "LowEnd", "off"));
@@ -939,6 +944,7 @@ bool save() {
     // the app's
     static const char* const LOW_END_KEYS[] = {"off", "on", "toaster"};
     app_setting_set_int("Graphics", "RenderScale", d.scale);
+    app_setting_set("Graphics", "Renderer", RENDERER_KEYS[std::clamp(d.renderer, 0, (int)std::size(RENDERER_KEYS) - 1)]);
     if (d.adreno_fix != o.adreno_fix) app_setting_set("Graphics", "AdrenoFix", d.adreno_fix ? "auto" : "off");
     app_setting_set("Graphics", "LowEnd", LOW_END_KEYS[std::clamp(d.low_end, 0, 2)]);
     app_setting_set("Graphics", "FpsCounter", d.stats ? "on" : "off");
@@ -2812,6 +2818,11 @@ void rows_graphics_30(std::vector<Row>& r) {
     add_choice(r, "scale", "3D resolution", pick, names, [](int v) { s.draft.scale = kPercents[v]; }, "RenderScale");
     if (pick < 0) r.back().value = std::to_string(c.scale) + "% (" + std::to_string(render_scale_times(c.scale)) + "x)";
     r.back().cold = true;
+    // The renderer: the phone's Vulkan driver, or the alternative GLES path (gpu/gles, android_main.cpp's
+    // [Graphics] Renderer). A new renderer is a new GPU: the next start.
+    add_choice(r, "renderer", "Renderer", std::clamp(c.renderer, 0, (int)std::size(RENDERER_KEYS) - 1),
+               {"Vulkan", "GLES"}, [](int v) { s.draft.renderer = v; }, "Renderer");
+    r.back().cold = true;
     // the Adreno fix (first_run.h; its row in Advanced): while it raises the choice, the row says what is drawn
     const int used = render_scale_used(c.scale, c.adreno_fix);
     if (used != render_scale_times(c.scale)) {
@@ -2821,7 +2832,10 @@ void rows_graphics_30(std::vector<Row>& r) {
         r.back().help = help_of("RenderScale") + " " + help_of(adreno_fix_applies() ? "RenderScale.adreno" : "RenderScale.limit");
     }
 }
-void reset_graphics_30() { s.draft.scale = defaults().scale; }
+void reset_graphics_30() {
+    Draft f = defaults();
+    s.draft.scale = f.scale, s.draft.renderer = f.renderer;
+}
 MENU_ENTRY("graphics", 30, rows_graphics_30, reset_graphics_30);
 void rows_graphics_40(std::vector<Row>& r) { add_bool(r, "shadows", "Shadows", &s.draft.shadows, "Shadows"); }
 void reset_graphics_40() { s.draft.shadows = defaults().shadows; }
@@ -3902,6 +3916,7 @@ const Help HELP[] = {
     // the HUD into the 3D picture, and the renderer scales the 3DS's screen by whole times, render_scale_times)
     {"RenderScale", "The resolution the 3D picture is drawn at: 100 % is your phone's own, as sharp as its screen shows; less is lighter on the phone. In brackets, the times the 3DS's (400x240) it comes to. 3DS: the console's own, for the weakest phones. It can only be a whole number of times the 3DS's screen (1x, 2x, 3x...), so each percent comes to the nearest of them: a 55 % or an exact size can't be drawn as such. The game draws its HUD and text into the same picture, so they are as sharp as this resolution.",
      "La resolución con que se dibuja la imagen 3D: 100 % es la del teléfono, tan nítida como la muestra su pantalla; menos le exige menos al teléfono. Entre paréntesis, cuántas veces la de la 3DS (400x240) resulta. 3DS: la de la consola, para los teléfonos más débiles. Solo puede ser un número entero de veces la pantalla de la 3DS (1x, 2x, 3x...), así que cada porcentaje se lleva al más cercano: un 55 % o un tamaño exacto no se pueden dibujar como tales. El juego dibuja su HUD y sus textos en la misma imagen, así que son tan nítidos como esta resolución."},
+    {"Renderer", "Which driver draws the game. Vulkan: the phone's Vulkan driver. GLES: the alternative renderer, on the app's own OpenGL ES context instead of the Vulkan driver (the path for a phone whose Vulkan driver draws the picture wrong). It is new: the texture combiner, the effects and the 3D's lighting are not there yet, so the picture is rough. The next start uses it."},
     {"RenderScale.adreno", "With this phone's Adreno driver it is drawn at 3x at least while the Adreno fix is on Auto.",
      "Con el driver Adreno de este teléfono se dibuja al menos a 3x mientras la corrección de Adreno está en Automático."},
     {"RenderScale.limit", "This phone's GPU can't make pictures that large: it is drawn at the most it can, after the dot.",

@@ -6,7 +6,9 @@
 //   [Graphics]  RenderScale = 100|75|50|0 (the 3D resolution, as MHGU's: a percent of the phone's own, 0 the 3DS's;
 //               render_scale_times makes it the runtime's --scale; next start)
 //               LowEnd = off|on|toaster (the preset's choice, as the panel last set it), FpsCounter = on|off,
-//               Shadows = on|off (at once: app_live.h), AdrenoFix = auto|off (first_run.h adreno_fix_applies; next start)
+//               Shadows = on|off (at once: app_live.h), AdrenoFix = auto|off (first_run.h adreno_fix_applies; next start),
+//               Renderer = vulkan|gles (the renderer's driver: the phone's Vulkan, or the alternative OpenGL ES path,
+//               gpu/gles; android_main.cpp picks gles-display for gles; next start)
 //   [Audio]     Volume = 0..100, Reverb = on|off (at once: app_live.h)
 //   [Display]   Layout = overlay|stacked|side, Corner = bottom-right|bottom-left|top-right|top-left,
 //               Size = 20..60 (% of the window's height), Opacity = 30..100, TouchScreen = shown|hidden
