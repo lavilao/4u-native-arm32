@@ -134,6 +134,12 @@ __attribute__((constructor)) static void resolve_linker_symbols() {
     if (android_get_device_api_level() < 28)
         return;
 
+    // The ARM32 dlopen wrapper calls a compact PLT trampoline; the ARM64 instruction scan below
+    // does not identify __loader_dlopen there. Leave the bypass unavailable rather than calling
+    // an invalid function pointer. Normal system-driver loading does not require this bypass.
+#if defined(__arm__)
+    return;
+#else
     // ARM64 specific function walking to locate the internal dlopen handler
     auto loader_dlopen{[]() {
         union BranchLinked {
@@ -191,4 +197,5 @@ __attribute__((constructor)) static void resolve_linker_symbols() {
 
     // Lib is now safe to use
     lib_loaded = true;
+#endif
 }

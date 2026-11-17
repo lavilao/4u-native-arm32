@@ -44,8 +44,12 @@ is the host's side:
   that asks for more. Everything above 1.1 was already an optional, probed capability (timeline
   semaphores, dynamic rendering and the rest; the SPIR-V is 1.3 for such a device), and newer
   drivers keep working under a 1.1 instance.
-- **libadrenotools** builds for armeabi-v7a as well (a 32-bit Adreno phone can still load its own
-  drivers); the bcenabler byte patch is AArch64-only data that only an Adreno would read.
+- **libadrenotools** builds for armeabi-v7a, but its linker-namespace bypass currently supports only
+  arm64: Android's 32-bit `dlopen` uses a compact PLT trampoline that the bypass's ARM64 code scan
+  cannot resolve safely. On arm32 the bypass stays disabled, so custom GPU-driver hooks are
+  unavailable; the app uses the system Vulkan driver instead. The constructor must not call through
+  an unvalidated pointer. The bcenabler byte patch remains AArch64-only data that only an Adreno
+  would read.
 - **crash reports** read the fault's pc and lr from the 32-bit frame (`arm_pc`, `arm_lr`).
 
 ## Limits
