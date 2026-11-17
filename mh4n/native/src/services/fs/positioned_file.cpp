@@ -26,6 +26,13 @@
 
 namespace mh4n::fs {
 
+#if !defined(_WIN32)
+// The game's RomFS is past 2 GiB: a 32-bit off_t (armeabi-v7a without _FILE_OFFSET_BITS=64) made every pread
+// there fail with EINVAL and the game crash on the bytes it got instead. The build turns that on for 32-bit
+// targets; this stops a build that loses it.
+static_assert(sizeof(off_t) >= 8, "off_t is 32-bit: build with -D_FILE_OFFSET_BITS=64 (CMakeLists.txt does)");
+#endif
+
 #if defined(_WIN32)
 
 struct PositionedFile::Impl {

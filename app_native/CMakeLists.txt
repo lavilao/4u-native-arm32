@@ -7,6 +7,13 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# A 32-bit off_t stops at 2 GiB: on armeabi-v7a every read of the game's RomFS past 2 GiB failed on the host
+# (the game then ran on the bytes it got and crashed). off_t is 64-bit with this, on Android and glibc alike.
+# (before the modules below, so that every one of them sees the same off_t and struct stat)
+if (CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT WIN32)
+  add_compile_definitions(_FILE_OFFSET_BITS=64)
+endif()
+
 find_package(SDL3 3.4.18 CONFIG REQUIRED)
 set(MH4N_TESTS OFF CACHE BOOL "" FORCE)
 set(MH4N_APP ON CACHE BOOL "" FORCE)
