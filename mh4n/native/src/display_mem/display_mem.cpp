@@ -611,8 +611,8 @@ std::unique_ptr<gpu::Gpu> MakeDisplayMem(gpu::Host& host, const Options& options
     return std::make_unique<DisplayMemGpu>(host, (*null_factory)(host, options));
 }
 
-// The alternative renderer (gpu/gles) with its screens shown the same way. It is the GX commands' and the screens'
-// plumbing only so far: its own picture comes when the drawing lands on it (gles_gpu.h).
+// The alternative renderer (gpu/gles) with its screens shown the same way: it draws into its own OpenGL ES targets and
+// writes each swapped colour buffer back into guest memory, which the screens are built from at VBlank.
 std::unique_ptr<gpu::Gpu> MakeGlesDisplay(gpu::Host& host, const Options& options) {
     const gpu::GpuFactory* gles_factory = Registry<gpu::GpuFactory>::Instance().Find("gles");
     if (gles_factory == nullptr) {

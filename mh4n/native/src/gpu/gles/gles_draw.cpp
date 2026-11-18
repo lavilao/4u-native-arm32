@@ -18,6 +18,7 @@ constexpr const char* kLog = "GlesGpu";
 constexpr u32 kRegCullMode = 0x40;
 constexpr u32 kRegViewportSizeX = 0x41;
 constexpr u32 kRegViewportSizeY = 0x43;
+constexpr u32 kRegScissorMode = 0x65;  // bits 0-1 (Disabled 0, Exclude 1, Include 3)
 constexpr u32 kRegScissorXY1 = 0x66;
 constexpr u32 kRegScissorXY2 = 0x67;
 constexpr u32 kRegViewportCorner = 0x68;
@@ -43,6 +44,10 @@ constexpr u32 kRegFramebufferSize = 0x11E;
 
 constexpr u32 kGasDensityMode = 1;  // FragmentOperationMode::Gas (the fog's density pass: no colour)
 constexpr u32 kShadowMode = 3;      // FragmentOperationMode::Shadow (into the shadow map: no colour)
+constexpr u32 kTextureTypeShadow2D = 2, kTextureTypeShadowCube = 4;  // TextureType (the shadow map: not here)
+// A unit whose texture is enabled but cannot be sampled here (the shadow map, an image that did not decode) reads this,
+// so a combiner that multiplies by it stays lit instead of turning black.
+constexpr u8 kWhitePixel[4] = {255, 255, 255, 255};
 
 // Azahar's Common::Rectangle: top >= bottom (y up).
 struct Rect4 {
@@ -75,6 +80,12 @@ void MakeRectangles(const std::array<u32, pica::kNumRegs>& regs, u32 height, boo
     out->viewport_width = static_cast<float>(std::abs(draw.right - draw.left));
     out->viewport_height = static_cast<float>(std::abs(draw.top - draw.bottom));
 
+    // The draw's own rectangle is what GL scissors to. The PICA's scissor mode Include cuts it further; Exclude is the
+    // fragment stage's discard (the rectangle is handed to it below).
+    out->scissor_x = draw.left;
+    out->scissor_y = h - draw.top;
+    out->scissor_width = static_cast<u32>(std::max(draw.right - draw.left, 0));
+    out->scissor_height = static_cast<u32>(std::max(draw.top - draw.bottom, 0));
     // The scissor registers: (x1, y1) in xy1, (x2, y2) in xy2, both inclusive, y up.
     Rect4 scissor{Signed10(pica::BitsOf(regs[kRegScissorXY1], 0, 10)),
                   static_cast<s32>(pica::BitsOf(regs[kRegScissorXY2], 16, 10)) + 1,
@@ -83,12 +94,20 @@ void MakeRectangles(const std::array<u32, pica::kNumRegs>& regs, u32 height, boo
     if (flipped) {
         scissor = Rect4{scissor.left, h - scissor.bottom, scissor.right, h - scissor.top};
     }
-    const s32 x0 = std::max(draw.left, scissor.left), x1 = std::min(draw.right, scissor.right);
-    const s32 y0 = std::max(draw.bottom, scissor.bottom), y1 = std::min(draw.top, scissor.top);
-    out->scissor_x = x0;
-    out->scissor_y = h - y1;
-    out->scissor_width = static_cast<u32>(std::max(x1 - x0, 0));
-    out->scissor_height = static_cast<u32>(std::max(y1 - y0, 0));
+    const u32 scissor_mode = pica::BitsOf(regs[kRegScissorMode], 0, 2);
+    out->fragment.scissor_mode = scissor_mode;
+    out->fragment.scissor_x0 = scissor.left;
+    out->fragment.scissor_y0 = h - scissor.top;
+    out->fragment.scissor_x1 = scissor.right;
+    out->fragment.scissor_y1 = h - scissor.bottom;
+    if (scissor_mode == 3) {  // Include
+        const s32 x0 = std::max(draw.left, scissor.left), x1 = std::min(draw.right, scissor.right);
+        const s32 y0 = std::max(draw.bottom, scissor.bottom), y1 = std::min(draw.top, scissor.top);
+        out->scissor_x = x0;
+        out->scissor_y = h - y1;
+        out->scissor_width = static_cast<u32>(std::max(x1 - x0, 0));
+        out->scissor_height = static_cast<u32>(std::max(y1 - y0, 0));
+    }
 }
 
 // The output merger's state, as fbops/fixed_function.cpp (MakeFixedFunctionState) reads it, plus the culling.
@@ -348,6 +367,7 @@ void Drawer::Draw(const pica::DrawCall& draw) {
     // The draw's textures, unit by unit, decoded by the texture cache: each image is uploaded once per generation.
     texture::TexturesOfDraw(regs.data(), texture_refs_, nullptr);
     draw_state.texture_count = 0;
+    bool found[3] = {false, false, false};
     for (u32 unit = 0; unit < 3; ++unit) {
         const auto ref = std::find_if(texture_refs_.begin(), texture_refs_.end(),
                                       [unit](const texture::TextureRef& r) { return r.unit == unit; });
@@ -368,9 +388,31 @@ void Drawer::Draw(const pica::DrawCall& draw) {
         const u32 params = regs[kRegTextureUnit[unit] + kTextureParams];
         texture.wrap_t = pica::BitsOf(params, 8, 3);
         texture.wrap_s = pica::BitsOf(params, 12, 3);
+        texture.mag_linear = pica::BitsOf(params, 1, 1) != 0;
+        texture.min_linear = pica::BitsOf(params, 2, 1) != 0;
         // Unit 2 reads texture coordinate 1 instead of 2 when the main config says so (texture2_use_coord1).
         texture.coordinate = unit == 2 && pica::BitsOf(regs[kRegMainConfig], 13, 1) != 0 ? 1 : unit;
         draw_state.texture_count = static_cast<int>(unit) + 1;
+        found[unit] = true;
+    }
+    // A unit the game turned on that this path cannot sample (the shadow map is the Vulkan path's, and an image may
+    // fail to decode) reads white, as an unshadowed texture would.
+    for (u32 unit = 0; unit < 3; ++unit) {
+        if (found[unit] || pica::BitsOf(regs[kRegMainConfig], unit, 1) == 0) {
+            continue;
+        }
+        const u32 params = regs[kRegTextureUnit[unit] + kTextureParams];
+        const u32 type = pica::BitsOf(params, 28, 3);
+        if (type == kTextureTypeShadow2D || type == kTextureTypeShadowCube) {
+            render::Texture& texture = draw_state.textures[unit];
+            texture.rgba8 = kWhitePixel;
+            texture.width = 1;
+            texture.height = 1;
+            texture.key = 0xFFFFFFFFFFFFFFFFull;
+            texture.wrap_s = texture.wrap_t = 0;
+            texture.coordinate = unit == 2 && pica::BitsOf(regs[kRegMainConfig], 13, 1) != 0 ? 1 : unit;
+            draw_state.texture_count = static_cast<int>(unit) + 1;
+        }
     }
 
     // The pass's first draw loads the buffer's existing picture from guest memory (the game's fills, and what earlier

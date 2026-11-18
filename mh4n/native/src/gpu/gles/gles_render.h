@@ -40,6 +40,9 @@ struct Texture {
     u32 wrap_s = 2;
     u32 wrap_t = 2;
     u32 coordinate = 0;
+    // The unit's filters (register bits 1 and 2): linear where the game asked for it, else nearest.
+    bool mag_linear = false;
+    bool min_linear = false;
 };
 
 // One combiner (TEV) stage, as its four register words hold it (gpu/fragment/regs.h): the colour sources in bits 0-11,
@@ -64,6 +67,10 @@ struct FragmentState {
     bool alpha_test = false;
     u32 alpha_func = 1;  // PICA CompareFunc (1 = Always)
     u32 alpha_ref = 0;
+    // The PICA's scissor mode (Disabled 0, Exclude 1, Include 3) and, for Exclude, the register rectangle in the
+    // fragment stage's pixels (x0, y0, x1, y1, y0 the bottom row): the pixels inside it are discarded.
+    u32 scissor_mode = 0;
+    int scissor_x0 = 0, scissor_y0 = 0, scissor_x1 = 0, scissor_y1 = 0;
 
     // The fog (registers 0xE0 and 0xE1): the mode the register names (5 = Fog), which way its depth runs (bit 16), the
     // colour, and the 128-entry look-up table the game filled (two half-precision words an entry, r then g: the factor is

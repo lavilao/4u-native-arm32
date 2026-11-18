@@ -35,12 +35,14 @@ layout(location = 1) in vec4 a_colour;
 layout(location = 2) in vec2 a_texcoord0;
 layout(location = 3) in vec2 a_texcoord1;
 layout(location = 4) in vec2 a_texcoord2;
+uniform int u_flip_y;
 out vec4 v_colour;
 out vec2 v_texcoord0;
 out vec2 v_texcoord1;
 out vec2 v_texcoord2;
 void main() {
-    gl_Position = a_position;
+    // As the Vulkan path's vertex stage: y is negated for a framebuffer whose flip bit is clear (`flip_viewport`).
+    gl_Position = vec4(a_position.x, u_flip_y != 0 ? -a_position.y : a_position.y, a_position.z, a_position.w);
     gl_PointSize = 1.0;
     v_colour = a_colour;
     v_texcoord0 = a_texcoord0;
@@ -81,6 +83,8 @@ uniform int u_update_alpha;
 uniform int u_alpha_test;
 uniform int u_alpha_func;
 uniform int u_alpha_ref;
+uniform int u_scissor_mode;
+uniform ivec4 u_scissor;
 
 uniform sampler2D u_fog_lut;
 uniform int u_fog_mode;
@@ -302,6 +306,15 @@ bool AlphaTestFails(int function, int alpha) {
 }
 
 void main() {
+    // The PICA's scissor mode Exclude: the pixels inside the register rectangle are not drawn (Include is the scissor
+    // rectangle the GL state carries).
+    if (u_scissor_mode == 1) {
+        int x = int(gl_FragCoord.x);
+        int y = int(gl_FragCoord.y);
+        if (x >= u_scissor.x && x < u_scissor.z && y >= u_scissor.y && y < u_scissor.w) {
+            discard;
+        }
+    }
     vec4 primary = byteround(v_colour);
     vec4 texture0 = u_has_texture0 != 0 ? texture(u_texture0, Coordinate(u_coordinate0, v_texcoord0, v_texcoord1, v_texcoord2)) : vec4(0.0);
     vec4 texture1 = u_has_texture1 != 0 ? texture(u_texture1, Coordinate(u_coordinate1, v_texcoord0, v_texcoord1, v_texcoord2)) : vec4(0.0);
@@ -389,7 +402,9 @@ void main() {
     // The fog (FogMode::Fog): the table the game filled turns the fragment's depth into a factor; the colour is mixed
     // towards the fog colour by it (gpu/fragment/fog/fog.cpp's WriteFog).
     if (u_fog_mode == 5) {
-        float fog_depth = clamp(gl_FragCoord.z, 0.0, 1.0);
+        // The PICA's depth: its clip space has z in [-w, 0] (the near clip plane is z <= 0), so GL's window depth
+        // 0.5 + 0.5 * z_ndc is 0.5 down to 0 at the near plane and 1 at the far one: -z/w = 2 * depth - 1.
+        float fog_depth = clamp(gl_FragCoord.z * 2.0 - 1.0, 0.0, 1.0);
         float fog_index = (u_fog_flip != 0 ? (1.0 - fog_depth) : fog_depth) * 128.0;
         float fog_i = clamp(floor(fog_index), 0.0, 127.0);
         float fog_f = fog_index - fog_i;
@@ -472,7 +487,8 @@ struct Composite {
 struct Uniforms {
     GLint source = -1, modifier = -1, ops = -1, scale = -1, constant = -1;
     GLint combiner_colour = -1, update_rgb = -1, update_alpha = -1;
-    GLint alpha_test = -1, alpha_func = -1, alpha_ref = -1;
+    GLint alpha_test = -1, alpha_func = -1, alpha_ref = -1, scissor_mode = -1, scissor = -1;
+    GLint flip_y = -1;
     GLint texture[3] = {-1, -1, -1}, has_texture[3] = {-1, -1, -1}, coordinate[3] = {-1, -1, -1};
     GLint fog_lut = -1, fog_mode = -1, fog_flip = -1, fog_colour = -1;
 };
@@ -491,6 +507,7 @@ struct Surface {
     GLuint destination = 0;
     bool has_stencil = false;    // the depth buffer carries a stencil, where the composite finds the covered pixels
     bool source_ok = false;      // the source framebuffer is complete
+    bool allocated = false;      // the attachments have been made for this target's size
     Target target;
     bool live = false;
     u64 used = 0;
@@ -510,6 +527,7 @@ struct Objects {
     std::unordered_map<u64, Surface> surfaces;  // a colour buffer (address, size) -> its target
     std::unordered_map<u64, GLuint> images;     // a texture's key -> the GL image of its pixels
     std::vector<u8> flipped;                    // the seed, row 0 last (GL's bottom row first)
+    std::vector<u8> upload;                     // an image's pixels, row 0 last (the same flip)
 };
 
 Objects g_;
@@ -584,6 +602,9 @@ bool Build(std::string* error) {
     u.alpha_test = glGetUniformLocation(program, "u_alpha_test");
     u.alpha_func = glGetUniformLocation(program, "u_alpha_func");
     u.alpha_ref = glGetUniformLocation(program, "u_alpha_ref");
+    u.scissor_mode = glGetUniformLocation(program, "u_scissor_mode");
+    u.scissor = glGetUniformLocation(program, "u_scissor");
+    u.flip_y = glGetUniformLocation(program, "u_flip_y");
     u.fog_lut = glGetUniformLocation(program, "u_fog_lut");
     u.fog_mode = glGetUniformLocation(program, "u_fog_mode");
     u.fog_flip = glGetUniformLocation(program, "u_fog_flip");
@@ -686,6 +707,9 @@ void DeleteSurface(Surface& surface) {
 // The surface's attachments, made (or made again when its size changed): the colour as a texture (so it can be read
 // back) and the depth buffer the 3D draws test against, 24 bits where the driver makes one, 16 where it does not.
 bool MakeAttachments(Surface& surface, std::string* error) {
+    if (surface.allocated) {
+        return true;
+    }
     const Target& target = surface.target;
     if (surface.fbo == 0) {
         glGenFramebuffers(1, &surface.fbo);
@@ -753,6 +777,7 @@ bool MakeAttachments(Surface& surface, std::string* error) {
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, surface.depth);
     surface.source_ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
     glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
+    surface.allocated = true;
     return true;
 }
 
@@ -840,8 +865,21 @@ GLuint ImageOf(const Texture& texture) {
     GLuint image = 0;
     glGenTextures(1, &image);
     glBindTexture(GL_TEXTURE_2D, image);
+    // The decoder's row 0 is the texture's v = 0 (the PICA's first row of tiles); GL's texture row 0 is v = 0 at the
+    // bottom, so the rows are reversed here, as the framebuffer's seed is.
+    const std::size_t row = static_cast<std::size_t>(texture.width) * 4;
+    const u8* pixels = texture.rgba8;
+    if (texture.height > 1) {
+        g_.upload.resize(row * texture.height);
+        for (u32 y = 0; y < texture.height; ++y) {
+            const u8* from = texture.rgba8 + static_cast<std::size_t>(y) * row;
+            std::copy(from, from + row, g_.upload.data() + static_cast<std::size_t>(texture.height - 1 - y) * row);
+        }
+        pixels = g_.upload.data();
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(texture.width), static_cast<GLsizei>(texture.height),
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, texture.rgba8);
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     g_.images.emplace(texture.key, image);
@@ -1092,6 +1130,10 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
     glUniform1i(u.alpha_test, state.fragment.alpha_test ? 1 : 0);
     glUniform1i(u.alpha_func, static_cast<GLint>(state.fragment.alpha_func & 7));
     glUniform1i(u.alpha_ref, static_cast<GLint>(state.fragment.alpha_ref & 0xFF));
+    glUniform1i(u.scissor_mode, static_cast<GLint>(state.fragment.scissor_mode & 3));
+    glUniform4i(u.scissor, state.fragment.scissor_x0, state.fragment.scissor_y0, state.fragment.scissor_x1,
+                state.fragment.scissor_y1);
+    glUniform1i(u.flip_y, state.flipped ? 1 : 0);
 
     for (int unit = 0; unit < 3; ++unit) {
         const bool set = unit < state.texture_count && state.textures[unit].rgba8 != nullptr;
@@ -1101,6 +1143,9 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
             glBindTexture(GL_TEXTURE_2D, ImageOf(texture));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, WrapMode(texture.wrap_s));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, WrapMode(texture.wrap_t));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, texture.mag_linear ? GL_LINEAR : GL_NEAREST);
+            // (the images have one level: a minification filter without mipmaps, whatever the LOD register says)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, texture.min_linear ? GL_LINEAR : GL_NEAREST);
             glUniform1i(u.texture[unit], unit);
         } else {
             glBindTexture(GL_TEXTURE_2D, 0);
