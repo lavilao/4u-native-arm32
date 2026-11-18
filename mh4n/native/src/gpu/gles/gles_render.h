@@ -22,6 +22,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,7 @@ struct Target {
     u32 width = 0;
     u32 height = 0;
     u32 address = 0;
+    u32 format = 2;  // the PICA colour format its pixels are stored in (FramebufferRegs 0x117 bits 16-18)
     friend bool operator==(const Target&, const Target&) = default;
 };
 
@@ -182,9 +184,20 @@ bool DrawVertexProgram(const VertexDraw& draw, const DrawState& state, std::stri
 // draw into it starts from the picture guest memory holds then.
 void EndFrame(u32 address);
 
+// Every colour buffer's pass is over: the blitter (a fill, a display transfer, a texture copy) wrote guest memory, so
+// the next draw into a buffer starts from what memory holds then, not from the rasterizer's older copy of it.
+void EndPasses();
+
 // The colour target as RGBA8 (`out` = width * height * 4, row 0 first): the target whose colour buffer is `address`
 // (the buffer the game swapped), else the one of the last draw.
 bool ReadTarget(u32 address, std::vector<u8>& out, u32* width, u32* height, std::string* error);
+
+// Hands every colour buffer drawn into since the last call to `store`, as RGBA8 (row 0 the PICA's first row of the
+// picture), with the guest address and colour format it is stored at. The GX engine's blitter (the fills, the display
+// transfers and the texture copies) and the texture cache read guest memory: this is how what the draws made gets there.
+// The buffers are read back before `store` is called, so it may bind framebuffers of its own. True when each one went.
+using StorePicture = std::function<bool(u32 address, u32 width, u32 height, u32 format, const u8* rgba8)>;
+bool WriteBackDrawn(const StorePicture& store);
 
 // One line for log.txt: the renderer's objects and the last target.
 std::string Describe();

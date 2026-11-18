@@ -1,6 +1,8 @@
 // The Vulkan vertex stage's GLSL as a GLSL ES 3.10 stage (gles_shader.h).
 #include "gpu/gles/gles_shader.h"
 
+#include <cstring>
+
 namespace mh4n::gpu::gles {
 
 namespace {
@@ -50,6 +52,13 @@ bool ToEsVertexStage(const std::string& vulkan_glsl, std::string* out, std::stri
     // `out_clip` pair of values is generated either way and goes with the writes below.
     if (s.find("gl_ClipDistance") != std::string::npos) {
         return fail("the stage clips with gl_ClipDistance, which GLSL ES has not");
+    }
+    // ES 3.10 has no `precise` (it is 3.20's, AEP_gpu_shader5): a driver refuses it as a reserved keyword, and the stage
+    // never compiles. Without it the driver may fuse the joins of a dot product, which is what the fast arithmetic the
+    // generator can emit allows anyway.
+    constexpr const char* kPrecise = "precise ";
+    for (std::size_t at = s.find(kPrecise); at != std::string::npos; at = s.find(kPrecise, at)) {
+        s.erase(at, std::strlen(kPrecise));
     }
 
     // The varyings the fragment program declares, by name (ES 3.0 links them without locations).

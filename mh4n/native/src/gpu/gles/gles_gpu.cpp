@@ -42,7 +42,21 @@ void GlesGpu::Execute(const GxCommand& command) {
         processor_.SubmitGxCmdList(ToPhysical(command.words[1]), command.words[2]);
         return;
     }
+    // The engine's blitter (a fill, a display transfer, a texture copy) reads and writes guest memory: what the draws
+    // made has to be in it first. This is how a frame reaches the screens — the game transfers its scene buffer into
+    // the LCD framebuffer, which display_mem then reads.
+    const bool blit = id == static_cast<u32>(gx::CommandId::MemoryFill) ||
+                      id == static_cast<u32>(gx::CommandId::DisplayTransfer) ||
+                      id == static_cast<u32>(gx::CommandId::TextureCopy) ||
+                      id == static_cast<u32>(gx::CommandId::RequestDma);
+    if (blit) {
+        WriteTargetsToGuest();
+    }
     gx_.Execute(command);
+    if (blit) {
+        // The blit wrote memory: every buffer's pass is over, so the next draw into one loads what memory holds now.
+        render::EndPasses();
+    }
     if (id == static_cast<u32>(gx::CommandId::CacheFlush) && command.words[2] != 0) {
         // The game told the GPU the CPU wrote the range the command names: the textures there are looked at again.
         drawer_.OnFlush(ToPhysical(command.words[1]), command.words[2]);
@@ -86,45 +100,32 @@ void GlesGpu::SetBufferSwap(u32 screen, const FrameBufferInfo& info) {
                      screen, ToPhysical(info.address_left), info.stride, info.format, target.width, target.height,
                      target.address);
         }
-        // The frame is drawn: its picture goes where the display reads it from.
-        WriteBack(screen);
-        // ... and the pass is over: the next draw into that buffer starts from what memory holds (WriteBack put it
-        // there, a memory fill may have changed it).
+        // The frame is drawn: the pass is over, so the next draw into that buffer starts from what guest memory holds
+        // then (the display transfer put the picture there, a memory fill may have changed it).
         render::EndFrame(ToPhysical(info.address_left));
     }
     gx_.SetBufferSwap(screen, info);
 }
 
-void GlesGpu::WriteBack(u32 screen) {
-    if (screen >= 2 || !has_swap_[screen]) {
+void GlesGpu::WriteTargetsToGuest() {
+    if (!has_context_) {
         return;
     }
-    const render::Target& target = drawer_.target();
-    if (target.width == 0 || target.height == 0) {
-        return;  // nothing was drawn yet
-    }
-    const FrameBufferInfo& info = swap_[screen];
-    const u32 address = ToPhysical(info.address_left);
-    if (info.stride == 0 || address == 0) {
+    const u64 written = drawer_.WriteBackDrawn();
+    if (written == 0) {
         return;
     }
-    if (drawer_.WriteColourToGuest(address, info.stride, target.height, info.format)) {
-        if (++writebacks_ == 1) {
-            MH4N_LOG(Info, kLog, "the picture is written back into guest memory ({}x{}, screen {})", target.width,
-                     target.height, screen);
-            // What the first frame drew and how: the draws' own vertex stages on the GPU, and the CPU's for the rest.
-            const DrawStats& stats = drawer_.GetStats();
-            MH4N_LOG(Info, kLog, "{} draws so far: {} on the GPU's vertex stage, {} on the CPU's, {} refused by it, {} "
-                                 "triangles; {}",
-                     stats.draws, stats.gpu_draws, stats.cpu_draws, stats.gpu_failures, stats.triangles,
-                     render::Describe());
-        }
-        return;
-    }
-    if (!told_writeback_failure_) {
-        told_writeback_failure_ = true;
-        MH4N_LOG(Error, kLog, "the picture could not be written back (screen {}, {:#010x}, stride {})", screen, address,
-                 info.stride);
+    if (++writebacks_ == 1) {
+        const render::Target& target = drawer_.target();
+        MH4N_LOG(Info, kLog, "the picture is written back into guest memory ({} colour buffer(s); the last {}x{} at "
+                             "{:#010x})",
+                 written, target.width, target.height, target.address);
+        // What the first frame drew and how: the draws' own vertex stages on the GPU, and the CPU's for the rest.
+        const DrawStats& stats = drawer_.GetStats();
+        MH4N_LOG(Info, kLog, "{} draws so far: {} on the GPU's vertex stage, {} on the CPU's, {} refused by it, {} "
+                             "triangles; {}",
+                 stats.draws, stats.gpu_draws, stats.cpu_draws, stats.gpu_failures, stats.triangles,
+                 render::Describe());
     }
 }
 
@@ -157,7 +158,7 @@ void GlesGpu::VBlank(u32 screen) {
     const DrawStats& stats = drawer_.GetStats();
     const render::Target& target = drawer_.target();
     MH4N_LOG(Info, kLog, "{} vblanks: {} draws ({} on the GPU's vertex stage, {} on the CPU's, {} refused by it), {} "
-                         "shadow, {} gas, {} dropped, {} failed, {} pictures written ({:#010x} {:#010x}); the last target "
+                         "shadow, {} gas, {} dropped, {} failed, {} write-backs ({:#010x} {:#010x}); the last target "
                          "{}x{} at {:#010x}; {}",
              vblanks_, stats.draws, stats.gpu_draws, stats.cpu_draws, stats.gpu_failures, stats.shadow, stats.gas,
              stats.dropped, stats.failed, writebacks_, ToPhysical(swap_[0].address_left),

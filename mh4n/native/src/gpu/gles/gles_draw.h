@@ -46,7 +46,7 @@ struct DrawStats {
     u64 dropped = 0;            // of them, ones the CPU runner could not run
     u64 failed = 0;             // of them, ones the rasterizer refused
     u64 triangles = 0;          // triangles drawn
-    u64 readbacks = 0;          // pictures written into guest memory
+    u64 readbacks = 0;          // colour buffers written into guest memory
 };
 
 // The colour formats of the PICA's framebuffer (ColorFormat; the same numbering as texture::Format's five).
@@ -69,9 +69,10 @@ public:
         textures_.OnInvalidate(paddr, size);
     }
 
-    // The last pass's colour target, written into guest memory as the frame buffer `info` names: `address` for `stride`
-    // bytes a row, of `format`, for `height` rows. False when there is no picture or the memory does not serve it.
-    bool WriteColourToGuest(u32 address, u32 stride, u32 height, u32 format);
+    // Every colour buffer drawn into since the last call, written into guest memory at its own address, in the PICA's
+    // 8x8 tiled layout and its colour format (gles_render.h WriteBackDrawn). The engine's display transfer reads its
+    // source from there, so this is what puts a frame on the screens.
+    u64 WriteBackDrawn();
 
     // The picture's size (the framebuffer of the last draw), 0 when nothing was drawn.
     const render::Target& target() const {

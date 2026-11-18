@@ -709,6 +709,7 @@ struct Surface {
     bool allocated = false;      // the attachments have been made for this target's size
     Target target;
     bool live = false;
+    bool dirty = false;  // a draw landed in it since the last write-back into guest memory
     u64 used = 0;
 };
 
@@ -920,7 +921,7 @@ bool Build(std::string* error) {
 // A colour buffer and its size name one target (two screens of one size are two).
 u64 SurfaceKey(const Target& target) {
     return static_cast<u64>(target.address) | (static_cast<u64>(target.width & 0x7FF) << 32) |
-           (static_cast<u64>(target.height & 0x3FF) << 43);
+           (static_cast<u64>(target.height & 0x3FF) << 43) | (static_cast<u64>(target.format & 7) << 53);
 }
 
 void DeleteSurface(Surface& surface) {
@@ -1399,6 +1400,12 @@ void EndFrame(u32 address) {
     }
 }
 
+void EndPasses() {
+    for (auto& entry : g_.surfaces) {
+        entry.second.live = false;
+    }
+}
+
 // The fixed-function state a draw's registers ask for (gles_render.h's DrawState). The caller has bound the target's
 // framebuffer and the program it draws with.
 void ApplyFixedState(const DrawState& state) {
@@ -1512,6 +1519,11 @@ void SelfTest() {
         // The fragment state: every stage replaces with the primary colour (the vertex colour), as a draw with no
         // texture does, and nothing else is on.
         DrawState state;
+        // (the whole target: a draw's own viewport comes from its registers, this one has none)
+        state.viewport_x = 0.0f;
+        state.viewport_y = 0.0f;
+        state.viewport_width = 64.0f;
+        state.viewport_height = 64.0f;
         state.depth_test = false;
         state.depth_write = false;
         state.colour_write = 0xF;
@@ -1629,6 +1641,7 @@ bool Submit(const DrawState& state, const std::function<void()>& issue, std::str
         *error = why;
         return false;
     }
+    g_.current->dirty = true;  // the picture its guest memory holds is out of date until the next write-back
     return true;
 }
 
@@ -1919,6 +1932,60 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
     return Submit(state, [count] { glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count)); }, error);
 }
 
+namespace {
+
+// A surface's colour buffer as RGBA8 rows, row 0 the PICA's first row of the picture (ReadTarget's flip).
+bool ReadSurface(Surface& surface, std::vector<u8>& out, u32* width, u32* height) {
+    const u32 w = surface.target.width, h = surface.target.height;
+    out.resize(static_cast<std::size_t>(w) * h * 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+    if (glGetError() != GL_NO_ERROR) {
+        return false;
+    }
+    // GL's row 0 is the bottom of the picture; the PICA's is the top, and so is what is written to guest memory.
+    std::vector<u8> row(static_cast<std::size_t>(w) * 4);
+    for (u32 y = 0; y < h / 2; ++y) {
+        u8* top = out.data() + static_cast<std::size_t>(y) * w * 4;
+        u8* bottom = out.data() + static_cast<std::size_t>(h - 1 - y) * w * 4;
+        std::copy(top, top + row.size(), row.begin());
+        std::copy(bottom, bottom + row.size(), top);
+        std::copy(row.begin(), row.end(), bottom);
+    }
+    *width = w;
+    *height = h;
+    return true;
+}
+
+}  // namespace
+
+bool WriteBackDrawn(const StorePicture& store) {
+    if (!g_.built) {
+        return true;
+    }
+    bool ok = true;
+    for (auto& entry : g_.surfaces) {
+        Surface& surface = entry.second;
+        if (!surface.dirty) {
+            continue;
+        }
+        surface.dirty = false;
+        std::vector<u8> pixels;
+        u32 w = 0, h = 0;
+        if (!ReadSurface(surface, pixels, &w, &h)) {
+            MH4N_LOG(Error, kLog, "a {}x{} colour buffer could not be read back for guest memory",
+                     surface.target.width, surface.target.height);
+            ok = false;
+            continue;
+        }
+        if (!store(surface.target.address, w, h, surface.target.format, pixels.data())) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 bool ReadTarget(u32 address, std::vector<u8>& out, u32* width, u32* height, std::string* error) {
     if (!g_.built) {
         *error = "there is no target to read";
@@ -1941,26 +2008,10 @@ bool ReadTarget(u32 address, std::vector<u8>& out, u32* width, u32* height, std:
         *error = "there is no target to read";
         return false;
     }
-    const u32 w = surface->target.width, h = surface->target.height;
-    out.resize(static_cast<std::size_t>(w) * h * 4);
-    glBindFramebuffer(GL_FRAMEBUFFER, surface->fbo);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE, out.data());
-    const GLenum error_gl = glGetError();
-    if (error_gl != GL_NO_ERROR) {
-        char why[96];
-        std::snprintf(why, sizeof(why), "the read back failed (0x%04X)", static_cast<unsigned>(error_gl));
-        *error = why;
+    u32 w = 0, h = 0;
+    if (!ReadSurface(*surface, out, &w, &h)) {
+        *error = "the read back failed";
         return false;
-    }
-    // GL's row 0 is the bottom of the picture; the PICA's is the top, and so is what is written to guest memory.
-    std::vector<u8> row(static_cast<std::size_t>(w) * 4);
-    for (u32 y = 0; y < h / 2; ++y) {
-        u8* top = out.data() + static_cast<std::size_t>(y) * w * 4;
-        u8* bottom = out.data() + static_cast<std::size_t>(h - 1 - y) * w * 4;
-        std::copy(top, top + row.size(), row.begin());
-        std::copy(bottom, bottom + row.size(), top);
-        std::copy(row.begin(), row.end(), bottom);
     }
     *width = w;
     *height = h;
@@ -2048,6 +2099,8 @@ bool Begin(const Target&, const TargetContents*, std::string* error) {
 
 void EndFrame(u32) {}
 
+void EndPasses() {}
+
 bool DrawTriangles(const void*, u32, const DrawState&, std::string* error) {
     *error = kNoGles;
     return false;
@@ -2063,6 +2116,10 @@ bool ReadTarget(u32, std::vector<u8>&, u32* width, u32* height, std::string* err
     *height = 0;
     *error = kNoGles;
     return false;
+}
+
+bool WriteBackDrawn(const StorePicture&) {
+    return true;
 }
 
 std::string Describe() {

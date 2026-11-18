@@ -8,8 +8,10 @@
 //     and the interrupts;
 //   - the PICA command processor (gpu/pica), which decodes the command lists into draws;
 //   - the drawer (gles_draw.h), which puts each draw through the CPU vertex path and the GLES rasterizer.
-// On a buffer swap the picture the draws made is written back into the framebuffer the swap names, in guest memory, so
-// that display_mem shows it as it shows the Vulkan path's.
+// The game never draws into the LCD buffers display_mem reads: it draws its scene into a colour buffer and asks the GX
+// engine for a display transfer from it into the screen's framebuffer. So before every fill, transfer and texture copy
+// the pictures the draws made are written back into guest memory, at their own colour buffers, in the PICA's tiled
+// layout; the engine's blitter then reads what the GLES rasterizer drew.
 //
 // Registered as "gles"; display_mem wraps it as "gles-display", which the app picks with [Graphics] Renderer = gles (or
 // the row in the options) in mh4u-app.ini.
@@ -44,8 +46,9 @@ public:
     }
 
 private:
-    // The last pass's picture into the framebuffer `screen`'s swap names, in guest memory.
-    void WriteBack(u32 screen);
+    // The pictures the draws made since the last call, into their colour buffers in guest memory (before a command that
+    // reads or writes memory).
+    void WriteTargetsToGuest();
     // A guest virtual address as a physical one (the texture cache's and the framebuffer's are physical).
     u32 ToPhysical(u32 vaddr) const;
 
@@ -56,7 +59,6 @@ private:
     FrameBufferInfo swap_[2] = {};
     bool has_swap_[2] = {false, false};
     bool has_context_ = false;
-    bool told_writeback_failure_ = false;
     bool told_swap_[2] = {false, false};  // the first swap of each screen, with its framebuffer registers
     u64 writebacks_ = 0;
     u64 vblanks_ = 0;  // top-screen VBlanks (the heartbeat's clock)
