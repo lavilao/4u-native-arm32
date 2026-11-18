@@ -80,6 +80,8 @@ void GlesGpu::SetBufferSwap(u32 screen, const FrameBufferInfo& info) {
         has_swap_[screen] = true;
         // The frame is drawn: its picture goes where the display reads it from.
         WriteBack(screen);
+        // ... and the pass is over: the next draw into that framebuffer starts from an empty target.
+        render::EndFrame();
     }
     gx_.SetBufferSwap(screen, info);
 }

@@ -13,14 +13,33 @@ namespace {
 
 constexpr const char* kLog = "GlesGpu";
 
-// RegsInternal: FramebufferRegs at 0x100, its framebuffer block at 0x110; RasterizerRegs at 0x40 (as native_gpu.cpp).
+// RegsInternal: FramebufferRegs at 0x100, its framebuffer block at 0x110; RasterizerRegs at 0x40 (as native_gpu.cpp
+// and fbops/fixed_function.cpp read them).
+constexpr u32 kRegCullMode = 0x40;
 constexpr u32 kRegViewportSizeX = 0x41;
 constexpr u32 kRegViewportSizeY = 0x43;
 constexpr u32 kRegScissorXY1 = 0x66;
 constexpr u32 kRegScissorXY2 = 0x67;
 constexpr u32 kRegViewportCorner = 0x68;
-constexpr u32 kRegColorFormat = 0x117;
+constexpr u32 kRegMainConfig = 0x80;
+constexpr u32 kRegTextureUnit[3] = {0x81, 0x91, 0x99};  // a unit: border colour, size, parameters, lod, address
+constexpr u32 kTextureParams = 2;                        // wrap t 8-10, wrap s 12-14
+constexpr u32 kRegTevStage[6] = {0xC0, 0xC8, 0xD0, 0xD8, 0xF0, 0xF8};
+constexpr u32 kTevSources = 0, kTevModifiers = 1, kTevOps = 2, kTevConstColour = 3, kTevScales = 4;
+constexpr u32 kRegFogModeAndMasks = 0xE0;  // fog mode 0-2, update mask rgb 8-11, update mask alpha 12-15
+constexpr u32 kRegTevCombinerBuffer = 0xFD;
+constexpr u32 kRegOutputMerger = 0x100;  // fragment operation mode 0-1, alphablend enable 8
+constexpr u32 kRegBlendEquations = 0x101;
+constexpr u32 kRegBlendConst = 0x103;
+constexpr u32 kRegAlphaTest = 0x104;      // enable 0, function 4-6, reference 8-15
+constexpr u32 kRegDepthColourMask = 0x107;  // depth test 0, function 4-6, colour mask 8-11, depth write 12
+constexpr u32 kRegAllowColourWrite = 0x113;  // bits 0-3
+constexpr u32 kRegAllowDepthStencil = 0x115;  // bits 0-1
+constexpr u32 kRegColourFormat = 0x117;
+constexpr u32 kRegColourAddress = 0x11D;  // bits 0-27, in units of 8 bytes
 constexpr u32 kRegFramebufferSize = 0x11E;
+
+constexpr u32 kShadowMode = 3;  // FragmentOperationMode::Shadow
 
 // Azahar's Common::Rectangle: top >= bottom (y up).
 struct Rect4 {
@@ -31,10 +50,9 @@ s32 Signed10(u32 v) {
     return static_cast<s32>(v << 22) >> 22;
 }
 
-// MakeGeometry of native_gpu.cpp, read into GL's pixels: the framebuffer's y axis points down there, so a rectangle
-// whose top is `top` starts at `height - top`.
-render::DrawState MakeDrawState(const std::array<u32, pica::kNumRegs>& regs, u32 height, bool flipped) {
-    render::DrawState out;
+// The viewport and scissor of a draw, in GL's pixels: the framebuffer's y axis points down there, so a rectangle whose
+// top is `top` starts at `height - top` (MakeGeometry of native_gpu.cpp, read into GL).
+void MakeRectangles(const std::array<u32, pica::kNumRegs>& regs, u32 height, bool flipped, render::DrawState* out) {
     const u32 corner_word = regs[kRegViewportCorner];
     const s32 corner_x = Signed10(pica::BitsOf(corner_word, 0, 10));
     const s32 corner_y = Signed10(pica::BitsOf(corner_word, 16, 10));
@@ -49,10 +67,10 @@ render::DrawState MakeDrawState(const std::array<u32, pica::kNumRegs>& regs, u32
     const s32 w = static_cast<s32>(regs[kRegFramebufferSize] & 0x7FF);
     Rect4 draw{std::clamp(viewport.left, 0, w), std::clamp(viewport.top, 0, h), std::clamp(viewport.right, 0, w),
                std::clamp(viewport.bottom, 0, h)};
-    out.viewport_x = static_cast<float>(draw.left);
-    out.viewport_y = static_cast<float>(h - draw.top);
-    out.viewport_width = static_cast<float>(std::abs(draw.right - draw.left));
-    out.viewport_height = static_cast<float>(std::abs(draw.top - draw.bottom));
+    out->viewport_x = static_cast<float>(draw.left);
+    out->viewport_y = static_cast<float>(h - draw.top);
+    out->viewport_width = static_cast<float>(std::abs(draw.right - draw.left));
+    out->viewport_height = static_cast<float>(std::abs(draw.top - draw.bottom));
 
     // The scissor registers: (x1, y1) in xy1, (x2, y2) in xy2, both inclusive, y up.
     Rect4 scissor{Signed10(pica::BitsOf(regs[kRegScissorXY1], 0, 10)),
@@ -64,14 +82,75 @@ render::DrawState MakeDrawState(const std::array<u32, pica::kNumRegs>& regs, u32
     }
     const s32 x0 = std::max(draw.left, scissor.left), x1 = std::min(draw.right, scissor.right);
     const s32 y0 = std::max(draw.bottom, scissor.bottom), y1 = std::min(draw.top, scissor.top);
-    out.scissor_x = x0;
-    out.scissor_y = h - y1;
-    out.scissor_width = static_cast<u32>(std::max(x1 - x0, 0));
-    out.scissor_height = static_cast<u32>(std::max(y1 - y0, 0));
-    // The depth test is always on for now (the output merger's registers are not read yet); depth writes with it.
-    out.depth_test = true;
-    out.depth_write = true;
-    return out;
+    out->scissor_x = x0;
+    out->scissor_y = h - y1;
+    out->scissor_width = static_cast<u32>(std::max(x1 - x0, 0));
+    out->scissor_height = static_cast<u32>(std::max(y1 - y0, 0));
+}
+
+// The output merger's state, as fbops/fixed_function.cpp (MakeFixedFunctionState) reads it, plus the culling.
+void MakeFixedFunction(const std::array<u32, pica::kNumRegs>& regs, bool flipped, render::DrawState* out) {
+    const u32 cull = pica::BitsOf(regs[kRegCullMode], 0, 2);
+    out->cull = cull;
+    out->flipped = flipped;
+
+    const u32 merger = regs[kRegOutputMerger];
+    out->blend = pica::BitsOf(merger, 8, 1) != 0;
+    if (out->blend) {
+        const u32 word = regs[kRegBlendEquations];
+        out->blend_equation_rgb = pica::BitsOf(word, 0, 3);
+        out->blend_equation_alpha = pica::BitsOf(word, 8, 3);
+        out->blend_source_rgb = pica::BitsOf(word, 16, 4);
+        out->blend_dest_rgb = pica::BitsOf(word, 20, 4);
+        out->blend_source_alpha = pica::BitsOf(word, 24, 4);
+        out->blend_dest_alpha = pica::BitsOf(word, 28, 4);
+        // A blend that writes the source as it is (One, Zero, Add in both halves; MH4U's opaque draws) is no blend.
+        if (out->blend_source_rgb == 1 && out->blend_dest_rgb == 0 && out->blend_equation_rgb == 0 &&
+            out->blend_source_alpha == 1 && out->blend_dest_alpha == 0 && out->blend_equation_alpha == 0) {
+            out->blend = false;
+        }
+    }
+    const u32 constant = regs[kRegBlendConst];
+    for (u32 channel = 0; channel < 4; ++channel) {
+        out->blend_constant[channel] = static_cast<float>(pica::BitsOf(constant, 8 * channel, 8)) / 255.0f;
+    }
+
+    const u32 depth_colour = regs[kRegDepthColourMask];
+    out->colour_write = pica::BitsOf(regs[kRegAllowColourWrite], 0, 4) != 0
+                            ? static_cast<u8>(pica::BitsOf(depth_colour, 8, 4))
+                            : 0;
+    const bool depth_test = pica::BitsOf(depth_colour, 0, 1) != 0;
+    const bool depth_write = pica::BitsOf(depth_colour, 12, 1) != 0;
+    if (depth_test || depth_write) {
+        out->depth_test = true;
+        out->depth_func = depth_test ? pica::BitsOf(depth_colour, 4, 3) : 1;  // Always
+        out->depth_write = pica::BitsOf(regs[kRegAllowDepthStencil], 0, 2) != 0 && depth_write;
+    } else {
+        out->depth_test = false;
+        out->depth_write = false;
+    }
+
+    // The alpha test, on the combiner's output alpha.
+    out->fragment.alpha_test = pica::BitsOf(regs[kRegAlphaTest], 0, 1) != 0;
+    out->fragment.alpha_func = pica::BitsOf(regs[kRegAlphaTest], 4, 3);
+    out->fragment.alpha_ref = pica::BitsOf(regs[kRegAlphaTest], 8, 8);
+}
+
+// The six combiner stages and the buffer they hand on.
+void MakeCombiner(const std::array<u32, pica::kNumRegs>& regs, render::FragmentState* out) {
+    for (u32 stage = 0; stage < 6; ++stage) {
+        const u32 base = kRegTevStage[stage];
+        render::CombinerStage& s = out->stages[stage];
+        s.sources = regs[base + kTevSources];
+        s.modifiers = regs[base + kTevModifiers];
+        s.ops = regs[base + kTevOps];
+        s.scales = regs[base + kTevScales];
+        s.constant = regs[base + kTevConstColour];
+    }
+    out->combiner_buffer_colour = regs[kRegTevCombinerBuffer];
+    // The fog register's update masks: which of stages 0-3 write their output into the combiner buffer.
+    out->update_rgb = pica::BitsOf(regs[kRegFogModeAndMasks], 8, 4);
+    out->update_alpha = pica::BitsOf(regs[kRegFogModeAndMasks], 12, 4);
 }
 
 }  // namespace
@@ -136,6 +215,11 @@ void Drawer::Draw(const pica::DrawCall& draw) {
     ++stats_.draws;
     // The primitive assembler applies the draw's register side effects first, whatever happens to the draw.
     assembler_.ApplyRegisterWrites(state);
+    if (pica::BitsOf(regs[kRegOutputMerger], 0, 2) == kShadowMode) {
+        // A shadow draw renders into no attachment (the shadow map is the Vulkan path's): nothing to show here.
+        ++stats_.shadow;
+        return;
+    }
     if (!cpuvertex::NeedsCpuPath(draw, assembler_.IsEmpty())) {
         // An accelerated draw: Azahar draws it with the translated vertex stage, which this path does not have yet.
         runner_.NoteDraw(draw);
@@ -165,25 +249,40 @@ void Drawer::Draw(const pica::DrawCall& draw) {
         ++stats_.dropped;
         return;
     }
-    target_ = render::Target{width, height};
-    const render::DrawState draw_state = MakeDrawState(regs, height, flipped);
+    const u32 colour_address = pica::BitsOf(regs[kRegColourAddress], 0, 28) * 8;
+    target_ = render::Target{width, height, host_.VirtualToPhysical(colour_address).value_or(colour_address)};
 
-    // The draw's first texture, decoded by the texture cache: its pixels are uploaded once per generation.
+    render::DrawState draw_state;
+    MakeRectangles(regs, height, flipped, &draw_state);
+    MakeFixedFunction(regs, flipped, &draw_state);
+    MakeCombiner(regs, &draw_state.fragment);
+
+    // The draw's textures, unit by unit, decoded by the texture cache: each image is uploaded once per generation.
     texture::TexturesOfDraw(regs.data(), texture_refs_, nullptr);
-    render::Texture texture;
-    const render::Texture* texture_ptr = nullptr;
-    if (!texture_refs_.empty()) {
-        const texture::TextureRef& ref = texture_refs_.front();
-        const texture::CachedTexture* cached =
-            textures_.Get(texture::CacheKey{ref.paddr, ref.format, ref.width, ref.height});
-        if (cached != nullptr && !cached->rgba8.empty()) {
-            texture.rgba8 = cached->rgba8.data();
-            texture.width = ref.width;
-            texture.height = ref.height;
-            // (the generation changes when the memory was decoded again: a new image, not the one uploaded for the old)
-            texture.key = (static_cast<u64>(cached->generation) << 32) ^ static_cast<u64>(ref.paddr);
-            texture_ptr = &texture;
+    draw_state.texture_count = 0;
+    for (u32 unit = 0; unit < 3; ++unit) {
+        const auto ref = std::find_if(texture_refs_.begin(), texture_refs_.end(),
+                                      [unit](const texture::TextureRef& r) { return r.unit == unit; });
+        if (ref == texture_refs_.end()) {
+            continue;
         }
+        const texture::CachedTexture* cached =
+            textures_.Get(texture::CacheKey{ref->paddr, ref->format, ref->width, ref->height});
+        if (cached == nullptr || cached->rgba8.empty()) {
+            continue;
+        }
+        render::Texture& texture = draw_state.textures[unit];
+        texture.rgba8 = cached->rgba8.data();
+        texture.width = ref->width;
+        texture.height = ref->height;
+        // (the generation changes when the memory was decoded again: a new image, not the one uploaded for the old)
+        texture.key = (static_cast<u64>(cached->generation) << 32) ^ static_cast<u64>(ref->paddr);
+        const u32 params = regs[kRegTextureUnit[unit] + kTextureParams];
+        texture.wrap_t = pica::BitsOf(params, 8, 3);
+        texture.wrap_s = pica::BitsOf(params, 12, 3);
+        // Unit 2 reads texture coordinate 1 instead of 2 when the main config says so (texture2_use_coord1).
+        texture.coordinate = unit == 2 && pica::BitsOf(regs[kRegMainConfig], 13, 1) != 0 ? 1 : unit;
+        draw_state.texture_count = static_cast<int>(unit) + 1;
     }
 
     std::string error;
@@ -197,7 +296,7 @@ void Drawer::Draw(const pica::DrawCall& draw) {
     }
     ++stats_.cpu_draws;
     stats_.triangles += batch_.TriangleCount();
-    if (!render::DrawTriangles(batch_.Data(), static_cast<u32>(batch_.VertexCount()), draw_state, texture_ptr, &error)) {
+    if (!render::DrawTriangles(batch_.Data(), static_cast<u32>(batch_.VertexCount()), draw_state, &error)) {
         ++stats_.failed;
         if (!told_failure_) {
             told_failure_ = true;

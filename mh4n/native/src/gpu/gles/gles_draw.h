@@ -4,13 +4,16 @@
 // Per draw, as triangle_batch.h's recipe says:
 //   1. the primitive assembler applies the draw's register side effects;
 //   2. a draw Azahar would accelerate is not drawn here yet (it needs the vertex stage the Vulkan path translates), so
-//      it is noted and skipped;
+//      it is noted and skipped, and so is a draw in the shadow mode (it renders into no attachment);
 //   3. the CPU runner shades it, the assembler builds its triangles, the batch fixes the quaternions up;
-//   4. the framebuffer registers give the target, the viewport and the scissor, the texture registers the first texture
-//      (decoded by the texture cache), and the rasterizer draws them.
-// What is not here yet: the texture combiner and the other fragment stages, the depth and blend state (the depth test
-// is always on), the PICA's own clears, and the accelerated draws. The picture is therefore the game's geometry with its
-// vertex colours and one texture, which is enough to tell that this path draws at all.
+//   4. the framebuffer registers give the target (size and colour buffer), the viewport and the scissor; the texturing
+//      registers the three units and the six combiner stages, the fragment registers the alpha test, and the framebuffer
+//      registers the output merger (depth test and its function and write, the colour write mask, blending, culling);
+//      then the rasterizer draws them.
+// What is not here yet: the fog, the lighting (a draw's primary colour is its vertex colour), the procedural texture,
+// the shadow stages, the logic op (GLES has none: a draw that asks for one is copied), and the accelerated draws. The
+// picture is therefore the game's geometry with the PICA's own combine of its colours and textures, which is what the
+// game's 2D screens are made of.
 //
 // Thread: the GPU's, as the command processor's (principle 6).
 #pragma once
@@ -33,6 +36,7 @@ struct DrawStats {
     u64 draws = 0;              // draws the PICA issued
     u64 cpu_draws = 0;          // of them, shaded on the CPU and put through the rasterizer
     u64 accelerated = 0;        // of them, ones Azahar accelerates: not drawn here yet
+    u64 shadow = 0;             // of them, ones in the shadow mode (no attachment): not drawn here
     u64 dropped = 0;            // of them, ones the CPU runner could not run
     u64 failed = 0;             // of them, ones the rasterizer refused
     u64 triangles = 0;          // triangles drawn
