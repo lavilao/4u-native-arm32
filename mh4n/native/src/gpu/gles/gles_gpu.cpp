@@ -78,6 +78,14 @@ void GlesGpu::SetBufferSwap(u32 screen, const FrameBufferInfo& info) {
     if (screen < 2) {
         swap_[screen] = info;
         has_swap_[screen] = true;
+        if (!told_swap_[screen]) {
+            // (what the display will read this screen from, beside what the draws made: the two must agree)
+            told_swap_[screen] = true;
+            const render::Target& target = drawer_.target();
+            MH4N_LOG(Info, kLog, "screen {} is swapped into {:#010x} (stride {}, format {}); the draws made {}x{} at {:#010x}",
+                     screen, ToPhysical(info.address_left), info.stride, info.format, target.width, target.height,
+                     target.address);
+        }
         // The frame is drawn: its picture goes where the display reads it from.
         WriteBack(screen);
         // ... and the pass is over: the next draw into that buffer starts from what memory holds (WriteBack put it
@@ -138,6 +146,22 @@ void GlesGpu::InvalidateRegion(u32 vaddr, u32 size) {
 
 void GlesGpu::VBlank(u32 screen) {
     gx_.VBlank(screen);
+    if (screen != 0) {
+        return;
+    }
+    // A heartbeat: even when no picture reaches the screen, the log says whether draws arrive and what they made.
+    constexpr u64 kEvery = 120;
+    if (++vblanks_ % kEvery != 0) {
+        return;
+    }
+    const DrawStats& stats = drawer_.GetStats();
+    const render::Target& target = drawer_.target();
+    MH4N_LOG(Info, kLog, "{} vblanks: {} draws ({} on the GPU's vertex stage, {} on the CPU's, {} refused by it), {} "
+                         "shadow, {} gas, {} dropped, {} failed, {} pictures written ({:#010x} {:#010x}); the last target "
+                         "{}x{} at {:#010x}; {}",
+             vblanks_, stats.draws, stats.gpu_draws, stats.cpu_draws, stats.gpu_failures, stats.shadow, stats.gas,
+             stats.dropped, stats.failed, writebacks_, ToPhysical(swap_[0].address_left),
+             ToPhysical(swap_[1].address_left), target.width, target.height, target.address, render::Describe());
 }
 
 MH4N_REGISTER(GpuFactory, "gles", [](Host& host, const Options&) -> std::unique_ptr<Gpu> {

@@ -24,6 +24,8 @@ namespace mh4n::gpu::gles::render {
 
 namespace {
 
+constexpr const char* kLog = "GlesGpu";
+
 // triangle_batch.h's HardwareVertex: 88 bytes, attributes 0 position, 1 colour, 2 texcoord0, 3 texcoord1, 4 texcoord2,
 // 5 texcoord0_w, 6 normquat, 7 view. The stages here read the position, the colour and the three coordinates.
 constexpr unsigned kVertexStride = 88;
@@ -727,6 +729,7 @@ constexpr std::size_t kMaxPrograms = 48;
 
 struct Objects {
     bool built = false;
+    bool tested = false;  // the renderer's own test triangle has been drawn (SelfTest)
     Composite composite;
     GLuint program = 0;
     GLuint vao = 0;
@@ -1344,6 +1347,9 @@ bool IsPassStarted(const Target& target) {
     return it != g_.surfaces.end() && it->second.live;
 }
 
+// The renderer's own test draw (below ApplyUniforms): once the program is built.
+void SelfTest();
+
 bool Begin(const Target& target, const TargetContents* contents, std::string* error) {
     if (!MakeCurrent(error)) {
         return false;
@@ -1354,6 +1360,11 @@ bool Begin(const Target& target, const TargetContents* contents, std::string* er
     }
     if (!g_.built && !Build(error)) {
         return false;
+    }
+    if (!g_.tested) {
+        // (a GL context is current by now: the program is built, so the renderer can try itself once)
+        g_.tested = true;
+        SelfTest();
     }
     // A draw into another colour buffer (the other screen, or the frame after a swap) starts that buffer's pass: its
     // picture is loaded once, at the first draw into it.
@@ -1468,6 +1479,87 @@ void ApplyUniforms(const DrawState& state, const Uniforms& u) {
     }
     SetFog(state.fragment, u);
     SetProcTex(state.fragment.proctex, u);
+}
+
+// The renderer's own test draw, once per built program: a red triangle in clip space through the batch program into a
+// 64x64 framebuffer of its own, read back. It tells the log what a black screen otherwise leaves in doubt — that the
+// driver compiled both stages, that a draw lands, and that pixels come back — and names the GL error when they do not.
+void SelfTest() {
+    GLuint fbo = 0, colour = 0;
+    glGenFramebuffers(1, &fbo);
+    glGenTextures(1, &colour);
+    glBindTexture(GL_TEXTURE_2D, colour);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colour, 0);
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    u8 pixel[4] = {0, 0, 0, 0};
+    GLenum error_gl = GL_NO_ERROR;
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        error_gl = status;
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glViewport(0, 0, 64, 64);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        // The fragment state: every stage replaces with the primary colour (the vertex colour), as a draw with no
+        // texture does, and nothing else is on.
+        DrawState state;
+        state.depth_test = false;
+        state.depth_write = false;
+        state.colour_write = 0xF;
+        state.cull = 0;
+        state.blend = false;
+        state.logic_op = 3;  // Copy
+        state.fragment.alpha_test = false;
+        state.fragment.fog_mode = 0;
+        for (int stage = 0; stage < 6; ++stage) {
+            CombinerStage& s = state.fragment.stages[stage];
+            s.sources = 0;  // PrimaryColor (source 0) in all three colour sources and the alpha ones
+            s.modifiers = 0;
+            s.ops = 0;  // Replace
+            s.scales = 0;
+        }
+
+        // A triangle over the middle of the target: the PICA's clip space has z in [-w, 0], so z = 0 is the near plane.
+        cpuvertex::HardwareVertex triangle[3]{};
+        const float positions[3][4] = {{-0.8f, -0.8f, 0.0f, 1.0f}, {0.8f, -0.8f, 0.0f, 1.0f}, {0.0f, 0.8f, 0.0f, 1.0f}};
+        for (int i = 0; i < 3; ++i) {
+            std::copy(positions[i], positions[i] + 4, triangle[i].position);
+            triangle[i].color[0] = 1.0f;  // red
+            triangle[i].color[3] = 1.0f;
+        }
+
+        glUseProgram(g_.program);
+        ApplyFixedState(state);
+        ApplyUniforms(state, g_.uniforms);
+        glBindVertexArray(g_.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, g_.vbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(sizeof(triangle)), triangle, GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+        error_gl = glGetError();
+        glUseProgram(0);
+        glBindVertexArray(0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &colour);
+    if (error_gl != GL_NO_ERROR) {
+        MH4N_LOG(Error, kLog, "the renderer's own test triangle failed (0x%04X): its draws will not be seen",
+                 static_cast<unsigned>(error_gl));
+    } else {
+        MH4N_LOG(Info, kLog, "the renderer's own test triangle: the centre pixel came out r {}, g {}, b {}, a {}",
+                 static_cast<unsigned>(pixel[0]), static_cast<unsigned>(pixel[1]), static_cast<unsigned>(pixel[2]),
+                 static_cast<unsigned>(pixel[3]));
+    }
 }
 
 // Issues a draw into the current surface, with the logic op emulated where GLES has none: `issue` draws the geometry,

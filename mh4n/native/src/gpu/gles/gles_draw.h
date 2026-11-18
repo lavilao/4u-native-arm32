@@ -96,6 +96,8 @@ private:
     DrawStats stats_;
     bool told_failure_ = false;
     bool told_gpu_failure_ = false;  // (the GPU vertex stage's first refusal, logged once)
+    bool told_first_draw_ = false;   // (the first draw's target, viewport and state, logged once)
+    bool told_writeback_ = false;    // (why a write-back failed, logged once)
 };
 
 }  // namespace mh4n::gpu::gles

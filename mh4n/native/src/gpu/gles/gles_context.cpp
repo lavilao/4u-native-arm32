@@ -39,9 +39,21 @@ std::string StringOfDisplay(EGLDisplay display, EGLint name) {
 }
 
 // An ES 3 config with the formats the game's framebuffers use (RGBA8, D24S8) and no window: the screens are
-// framebuffer objects of the renderer's own.
-EGLConfig ChooseConfig(EGLDisplay display) {
-    const EGLint wanted[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+// framebuffer objects of the renderer's own. Some drivers (PowerVR's among them) advertise no PBuffer config for
+// OpenGL ES 3 at all, and asking only for one leaves the renderer with no config, no context and nothing drawn, so the
+// requests go from the strictest to the most permissive and the one that answered is told in the log.
+EGLConfig AskConfig(EGLDisplay display, const EGLint* attribs, const char* what, std::string* how) {
+    EGLConfig config = nullptr;
+    EGLint count = 0;
+    if (eglChooseConfig(display, attribs, &config, 1, &count) == EGL_TRUE && count >= 1 && config != nullptr) {
+        *how = what;
+        return config;
+    }
+    return nullptr;
+}
+
+EGLConfig ChooseConfig(EGLDisplay display, std::string* how) {
+    const EGLint strict[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
                              EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
                              EGL_RED_SIZE, 8,
                              EGL_GREEN_SIZE, 8,
@@ -50,18 +62,28 @@ EGLConfig ChooseConfig(EGLDisplay display) {
                              EGL_DEPTH_SIZE, 24,
                              EGL_STENCIL_SIZE, 8,
                              EGL_NONE};
-    EGLConfig config = nullptr;
-    EGLint count = 0;
-    if (eglChooseConfig(display, wanted, &config, 1, &count) != EGL_TRUE || count < 1) {
-        // A driver without a 24-bit depth config still draws: ask only for what no ES3 config lacks.
-        const EGLint loose[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-                                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
-        count = 0;
-        if (eglChooseConfig(display, loose, &config, 1, &count) != EGL_TRUE || count < 1) {
-            return nullptr;
-        }
+    // A driver without a 24-bit depth config still draws: ask only for what no ES3 config lacks.
+    const EGLint pbuffer[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                              EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+    // No PBuffer for ES3 on this driver: any surface type, and a surfaceless context (below) where it has one.
+    const EGLint no_surface_type[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_RED_SIZE, 8,   EGL_GREEN_SIZE, 8,
+                                      EGL_BLUE_SIZE,    8,                         EGL_ALPHA_SIZE, 8,  EGL_NONE};
+    const EGLint es2_bit[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                              EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+    const EGLint anything[] = {EGL_NONE};
+    if (EGLConfig config = AskConfig(display, strict, "ES3, 8-bit colour, 24-bit depth, PBuffer", how)) {
+        return config;
     }
-    return config;
+    if (EGLConfig config = AskConfig(display, pbuffer, "ES3, 8-bit colour, PBuffer", how)) {
+        return config;
+    }
+    if (EGLConfig config = AskConfig(display, no_surface_type, "ES3, 8-bit colour, any surface", how)) {
+        return config;
+    }
+    if (EGLConfig config = AskConfig(display, es2_bit, "ES2-flagged config (an ES3 context may still be made)", how)) {
+        return config;
+    }
+    return AskConfig(display, anything, "the first config the driver offers", how);
 }
 
 // The context as asked for (ES 3.1, for compute and the storage buffers the renderer's shaders use), else the best the
@@ -119,7 +141,8 @@ bool MakeCurrent(std::string* error) {
     if (eglBindAPI(EGL_OPENGL_ES_API) != EGL_TRUE) {
         return fail("eglBindAPI(EGL_OPENGL_ES_API) failed");
     }
-    const EGLConfig config = ChooseConfig(g_display);
+    std::string config_how;
+    const EGLConfig config = ChooseConfig(g_display, &config_how);
     if (config == nullptr) {
         return fail("the driver offers no OpenGL ES 3 config");
     }
@@ -127,17 +150,27 @@ bool MakeCurrent(std::string* error) {
     g_context = CreateContext(g_display, config, &how);
     if (g_context == EGL_NO_CONTEXT) {
         char why[64];
-        std::snprintf(why, sizeof(why), "eglCreateContext failed (0x%04X)", static_cast<unsigned>(eglGetError()));
+        std::snprintf(why, sizeof(why), "eglCreateContext failed (0x%04X) on the %s",
+                      static_cast<unsigned>(eglGetError()), config_how.c_str());
         return fail(why);
     }
+    // The surface the context is made current on: a 1x1 PBuffer (nothing is drawn into it: the screens are framebuffer
+    // objects of the renderer's own), or none at all where the driver has EGL_KHR_surfaceless_context and the config it
+    // gave has no PBuffer.
     const EGLint pbuffer[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     g_surface = eglCreatePbufferSurface(g_display, config, pbuffer);
     if (g_surface == EGL_NO_SURFACE) {
-        char why[96];
-        std::snprintf(why, sizeof(why), "eglCreatePbufferSurface failed (0x%04X)", static_cast<unsigned>(eglGetError()));
-        return fail(why);
-    }
-    if (eglMakeCurrent(g_display, g_surface, g_surface, g_context) != EGL_TRUE) {
+        const EGLint error = eglGetError();
+        if (eglMakeCurrent(g_display, EGL_NO_SURFACE, EGL_NO_SURFACE, g_context) == EGL_TRUE) {
+            how += " (surfaceless)";
+            MH4N_LOG(Info, kLog, "no PBuffer for the %s (0x%04X): the context is surfaceless", config_how, error);
+        } else {
+            char why[128];
+            std::snprintf(why, sizeof(why), "eglCreatePbufferSurface failed (0x%04X) on the %s",
+                          static_cast<unsigned>(error), config_how.c_str());
+            return fail(why);
+        }
+    } else if (eglMakeCurrent(g_display, g_surface, g_surface, g_context) != EGL_TRUE) {
         char why[64];
         std::snprintf(why, sizeof(why), "eglMakeCurrent failed (0x%04X)", static_cast<unsigned>(eglGetError()));
         return fail(why);
@@ -152,7 +185,7 @@ bool MakeCurrent(std::string* error) {
     glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &g_info.max_renderbuffer);
     MH4N_LOG(Info, kLog, "gl: {} on \"{}\", GLSL \"{}\"; EGL \"{}\", vendor \"{}\"", g_info.gl_version, g_info.gl_renderer,
              g_info.gl_slang, g_info.egl_version, g_info.egl_vendor);
-    MH4N_LOG(Info, kLog, "gl: {}", how);
+    MH4N_LOG(Info, kLog, "gl: {} (config: {})", how, config_how);
     return true;
 }
 

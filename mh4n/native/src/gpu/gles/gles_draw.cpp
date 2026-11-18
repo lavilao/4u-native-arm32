@@ -442,6 +442,19 @@ void Drawer::Draw(const pica::DrawCall& draw) {
         }
     }
 
+    if (!told_first_draw_) {
+        // What the first draw made of the registers: a black screen's causes are all here (an empty viewport, a scissor
+        // that cuts everything, a target of no size, a draw that wanted its own vertex stage and did not get it).
+        told_first_draw_ = true;
+        MH4N_LOG(Info, kLog,
+                 "the first draw: a {}x{} colour buffer at {:#010x}, viewport {} {} {} {}, scissor {} {} {} {}, {} "
+                 "texture(s), cull {}, depth {}, colour mask {:#x}, the draw's own vertex stage {}",
+                 width, height, target_.address, draw_state.viewport_x, draw_state.viewport_y,
+                 draw_state.viewport_width, draw_state.viewport_height, draw_state.scissor_x, draw_state.scissor_y,
+                 draw_state.scissor_width, draw_state.scissor_height, draw_state.texture_count, draw_state.cull,
+                 draw_state.depth_test ? "on" : "off", draw_state.colour_write, accelerated ? "wanted" : "not wanted");
+    }
+
     // The pass's first draw loads the buffer's existing picture from guest memory (the game's fills, and what earlier
     // passes drew): only then is it needed, so the read is skipped while the pass goes on.
     render::TargetContents contents;
@@ -525,18 +538,27 @@ bool Drawer::WriteColourToGuest(u32 address, u32 stride, u32 height, u32 format)
     u32 width = 0;
     u32 rows = 0;
     std::string error;
-    if (!render::ReadTarget(address, picture_, &width, &rows, &error)) {
+    const auto fail = [&](const std::string& why) {
+        if (!told_writeback_) {
+            told_writeback_ = true;
+            MH4N_LOG(Error, kLog, "the picture is not written into guest memory: {}", why);
+        }
         return false;
+    };
+    if (!render::ReadTarget(address, picture_, &width, &rows, &error)) {
+        return fail("it could not be read back (" + error + ")");
     }
     rows = std::min(rows, height);
     const u32 bpp = PicaBytesPerPixel(format);
     if (bpp == 0 || width == 0 || rows == 0 || stride < width * bpp) {
-        return false;
+        return fail(fmt::format("the {}x{} picture does not fit the display buffer at {:#010x} (stride {} bytes, {} bytes "
+                                "a pixel)",
+                                width, rows, address, stride, bpp));
     }
     for (u32 y = 0; y < rows; ++y) {
         u8* row = host_.PhysicalPointer(address + y * stride, width * bpp);
         if (row == nullptr) {
-            return false;
+            return fail(fmt::format("row {} of it at {:#010x} is not in guest memory", y, address + y * stride));
         }
         EncodeColourRow(picture_.data() + static_cast<std::size_t>(y) * width * 4, width, format, row);
     }

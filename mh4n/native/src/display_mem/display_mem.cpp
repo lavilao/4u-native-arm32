@@ -611,10 +611,37 @@ std::unique_ptr<gpu::Gpu> MakeDisplayMem(gpu::Host& host, const Options& options
     return std::make_unique<DisplayMemGpu>(host, (*null_factory)(host, options));
 }
 
+// The registers a GPU engine that starts zeroed has to be given (PicaCore::InitializeRegs: the values GSP sets and the
+// framebuffer defaults of nn::gx). They are the LCD framebuffers' addresses, sizes, strides and formats, without which
+// the display finds no framebuffer to build a screen from (a black window), and the IRQ and geometry shader configs.
+// Only the registers the inner GPU still holds as zero are written: whatever it made of the game's own writes stays.
+void SeedGxRegisters(gpu::Gpu& seed, gpu::Gpu& inner) {
+    using Shadow = gpu_capture::DisplayShadow;
+    u32 copied = 0;
+    for (u32 i = 0; i < Shadow::kGpuRegWords; ++i) {
+        const u32 addr = Shadow::kGpuBase + 4 * i;
+        if (const u32 value = seed.ReadReg(addr); value != 0 && inner.ReadReg(addr) == 0) {
+            inner.WriteReg(addr, value);
+            ++copied;
+        }
+    }
+    for (u32 i = 0; i < Shadow::kLcdRegWords; ++i) {
+        const u32 addr = Shadow::kLcdBase + 4 * i;
+        if (const u32 value = seed.ReadReg(addr); value != 0 && inner.ReadReg(addr) == 0) {
+            inner.WriteReg(addr, value);
+            ++copied;
+        }
+    }
+    MH4N_LOG(Info, kLog, "the renderer starts with {} of the GSP's default register(s) (the screens' framebuffers among them)",
+             copied);
+}
+
 // The alternative renderer (gpu/gles) with its screens shown the same way: it draws into its own OpenGL ES targets and
 // writes each swapped colour buffer back into guest memory, which the screens are built from at VBlank.
 std::unique_ptr<gpu::Gpu> MakeGlesDisplay(gpu::Host& host, const Options& options) {
-    const gpu::GpuFactory* gles_factory = Registry<gpu::GpuFactory>::Instance().Find("gles");
+    const auto& registry = Registry<gpu::GpuFactory>::Instance();
+    const gpu::GpuFactory* gles_factory = registry.Find("gles");
+    const gpu::GpuFactory* null_factory = registry.Find("null");
     if (gles_factory == nullptr) {
         MH4N_LOG(Error, kLog, "the gles GPU is not registered");
         return nullptr;
@@ -622,6 +649,13 @@ std::unique_ptr<gpu::Gpu> MakeGlesDisplay(gpu::Host& host, const Options& option
     std::unique_ptr<gpu::Gpu> inner = (*gles_factory)(host, options);
     if (inner == nullptr) {
         return nullptr;
+    }
+    // Its GX engine starts with zeroed registers: the screens' framebuffers are seeded from the values the null GPU
+    // starts with, as the native renderer's are (its registers would otherwise hold no framebuffer at all).
+    if (null_factory != nullptr) {
+        if (std::unique_ptr<gpu::Gpu> seed = (*null_factory)(host, options)) {
+            SeedGxRegisters(*seed, *inner);
+        }
     }
     return std::make_unique<DisplayMemGpu>(host, std::move(inner));
 }
@@ -643,19 +677,7 @@ std::unique_ptr<gpu::Gpu> MakeNativeDisplayOn(gpu::Host& host, const Options& op
     if (inner == nullptr || seed == nullptr) {
         return nullptr;
     }
-    using Shadow = gpu_capture::DisplayShadow;
-    for (u32 i = 0; i < Shadow::kGpuRegWords; ++i) {
-        const u32 addr = Shadow::kGpuBase + 4 * i;
-        if (const u32 value = seed->ReadReg(addr); value != 0 && inner->ReadReg(addr) == 0) {
-            inner->WriteReg(addr, value);
-        }
-    }
-    for (u32 i = 0; i < Shadow::kLcdRegWords; ++i) {
-        const u32 addr = Shadow::kLcdBase + 4 * i;
-        if (const u32 value = seed->ReadReg(addr); value != 0 && inner->ReadReg(addr) == 0) {
-            inner->WriteReg(addr, value);
-        }
-    }
+    SeedGxRegisters(*seed, *inner);
     return std::make_unique<DisplayMemGpu>(host, std::move(inner));
 }
 
