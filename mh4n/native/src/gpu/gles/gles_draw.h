@@ -4,8 +4,12 @@
 // Per draw, as triangle_batch.h's recipe says:
 //   1. the primitive assembler applies the draw's register side effects;
 //   2. a draw in the shadow mode (it renders into the shadow map) or of the fog's density pass is skipped: neither has a
-//      colour; a draw Azahar accelerates is shaded by the CPU vertex unit as any other, so the geometry is all drawn;
-//   3. the CPU runner shades it, the assembler builds its triangles, the batch fixes the quaternions up;
+//      colour; a draw Azahar accelerates keeps its own PICA vertex and fragment programs: see 3;
+//   3. a draw Azahar accelerates is loaded (vertex_loader.h) and its own vertex program, translated to GLSL ES, runs on
+//      the GPU over the draw's buffers (gles_render.h DrawVertexProgram), as lavilao/pocket-native's raster/gles does;
+//      a draw that cannot go that way — the CPU path's own, a program the translator or the driver refused, a topology
+//      this has not — is shaded by the CPU vertex unit, the assembler builds its triangles and the batch fixes the
+//      quaternions up;
 //   4. the framebuffer registers give the target (size and colour buffer), the viewport and the scissor; the texturing
 //      registers the three units and the six combiner stages, the fragment registers the alpha test, and the framebuffer
 //      registers the output merger (depth test and its function and write, the colour write mask, blending, culling);
@@ -34,7 +38,9 @@ namespace mh4n::gpu::gles {
 struct DrawStats {
     u64 draws = 0;              // draws the PICA issued
     u64 cpu_draws = 0;          // of them, shaded on the CPU and put through the rasterizer
-    u64 accelerated = 0;        // of them, ones Azahar accelerates (the CPU vertex unit shades them here)
+    u64 gpu_draws = 0;          // of them, whose own PICA program the GPU's vertex stage ran (DrawVertexProgram)
+    u64 gpu_failures = 0;       // of them, ones the GPU vertex stage could not take (they went the CPU way)
+    u64 accelerated = 0;        // of them, ones Azahar accelerates (the GPU vertex stage, or the CPU's when it cannot)
     u64 shadow = 0;             // of them, ones in the shadow mode (no attachment): not drawn here
     u64 gas = 0;                // of them, ones of the fog's density pass (no colour): not drawn here
     u64 dropped = 0;            // of them, ones the CPU runner could not run
@@ -78,6 +84,8 @@ public:
 private:
     gpu::Host& host_;
     cpuvertex::CpuVertexRunner runner_;
+    vertex::VertexLoader loader_{vertex::VertexCaps{}};  // the draw's attributes and buffers, for the GPU vertex stage
+    vertex::LoadedDraw loaded_;
     cpuvertex::PrimitiveAssembler assembler_;
     cpuvertex::TriangleBatch batch_;
     texture::TextureCache textures_;
@@ -87,6 +95,7 @@ private:
     std::vector<u8> seed_;     // the colour buffer as guest memory holds it, for a pass's first draw (RGBA8)
     DrawStats stats_;
     bool told_failure_ = false;
+    bool told_gpu_failure_ = false;  // (the GPU vertex stage's first refusal, logged once)
 };
 
 }  // namespace mh4n::gpu::gles

@@ -11,11 +11,14 @@ mh4n_module(
         gles_draw.cpp
         gles_gpu.cpp
         gles_render.cpp
+        gles_shader.cpp
     DEPENDS
         mh4n_gpu_cpuvertex
         mh4n_gpu_gx
         mh4n_gpu_pica
+        mh4n_gpu_shader
         mh4n_gpu_texture
+        mh4n_gpu_vertex
 )
 # The headers are included as "gpu/gles/<name>.h".
 target_include_directories(mh4n_gpu_gles PUBLIC "${MH4N_SRC_DIR}")

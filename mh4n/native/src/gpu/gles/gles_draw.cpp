@@ -307,6 +307,22 @@ u32 FogLutKey(const std::array<u32, 128>& lut) {
     return hash != 0 ? hash : 1;  // 0 is "not uploaded"
 }
 
+// The triangles a loaded draw covers (its primitive assembler's, for the counters).
+u64 TrianglesOf(const vertex::LoadedDraw& loaded) {
+    if (loaded.index_type != vertex::IndexType::None) {
+        return loaded.count / 3;  // (the loader has already turned strips and fans into lists where it could)
+    }
+    switch (loaded.topology) {
+    case vertex::Topology::TriangleStrip:
+    case vertex::Topology::TriangleFan:
+        return loaded.count > 2 ? loaded.count - 2 : 0;
+    case vertex::Topology::TriangleList:
+    case vertex::Topology::Shader:
+        break;
+    }
+    return loaded.count / 3;
+}
+
 void Drawer::Draw(const pica::DrawCall& draw) {
     const pica::PicaState& state = *draw.state;
     const auto& regs = state.regs;
@@ -324,23 +340,11 @@ void Drawer::Draw(const pica::DrawCall& draw) {
         ++stats_.gas;
         return;
     }
-    if (!cpuvertex::NeedsCpuPath(draw, assembler_.IsEmpty())) {
-        // A draw Azahar accelerates on the device's vertex stage: the CPU vertex unit shades it here too, so it is drawn
-        // (correctly, if not as quickly as the Vulkan path's translated shader would).
+    // Which way the draw's vertices are shaded: its own PICA program on the GPU (as the Vulkan path's translated stage
+    // does), or the CPU vertex unit for the draws Azahar does not accelerate and for those the GPU stage cannot take.
+    const bool accelerated = !cpuvertex::NeedsCpuPath(draw, assembler_.IsEmpty());
+    if (accelerated) {
         ++stats_.accelerated;
-    }
-    if (runner_.Run(host_, draw) != cpuvertex::RunStatus::Ok) {
-        ++stats_.dropped;
-        return;
-    }
-    batch_.Clear();
-    assembler_.SubmitStream(runner_.output(), [this](const cpuvertex::OutputVertex& v0,
-                                                      const cpuvertex::OutputVertex& v1,
-                                                      const cpuvertex::OutputVertex& v2) {
-        batch_.AddTriangle(v0, v1, v2);
-    });
-    if (batch_.Empty()) {
-        return;
     }
 
     // The framebuffer the draw goes into, and the viewport and scissor of its registers.
@@ -469,6 +473,41 @@ void Drawer::Draw(const pica::DrawCall& draw) {
             told_failure_ = true;
             MH4N_LOG(Error, kLog, "the rasterizer has no target: {}", error);
         }
+        return;
+    }
+    if (accelerated) {
+        // The GPU vertex stage: the draw's own PICA vertex program, translated to GLSL ES, over the draw's vertex
+        // buffers and index list (gles_render.h DrawVertexProgram, as lavilao/pocket-native's raster/gles does).
+        loader_.LoadInto(host_, draw, loaded_);
+        if (loaded_.status == vertex::LoadStatus::Ok && loaded_.count != 0) {
+            render::VertexDraw vertices;
+            vertices.state = &state;
+            vertices.loaded = &loaded_;
+            if (render::DrawVertexProgram(vertices, draw_state, &error)) {
+                ++stats_.gpu_draws;
+                stats_.triangles += TrianglesOf(loaded_);
+                return;
+            }
+            // (the reason is worth one line: a draw the GPU stage refuses is drawn by the CPU, but slower)
+            if (!told_gpu_failure_) {
+                told_gpu_failure_ = true;
+                MH4N_LOG(Info, kLog, "the draws' own vertex stage cannot take a draw ({}): the CPU shades those", error);
+            }
+            ++stats_.gpu_failures;
+        }
+    }
+    // The CPU vertex unit shades it, the assembler builds its triangles, the batch fixes the quaternions up.
+    if (runner_.Run(host_, draw) != cpuvertex::RunStatus::Ok) {
+        ++stats_.dropped;
+        return;
+    }
+    batch_.Clear();
+    assembler_.SubmitStream(runner_.output(), [this](const cpuvertex::OutputVertex& v0,
+                                                      const cpuvertex::OutputVertex& v1,
+                                                      const cpuvertex::OutputVertex& v2) {
+        batch_.AddTriangle(v0, v1, v2);
+    });
+    if (batch_.Empty()) {
         return;
     }
     ++stats_.cpu_draws;

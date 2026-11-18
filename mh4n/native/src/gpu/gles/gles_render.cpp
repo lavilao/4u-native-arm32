@@ -6,10 +6,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <unordered_map>
 
 #include "gpu/cpuvertex/triangle_batch.h"
 #include "gpu/gles/gles_context.h"
+#include "gpu/gles/gles_shader.h"
+#include "gpu/shader/vertex_shader.h"
+#include "gpu/vertex/vertex_loader.h"
 #include "mh4n/log.h"
 
 #if defined(__ANDROID__)
@@ -41,8 +45,12 @@ out vec2 v_texcoord0;
 out vec2 v_texcoord1;
 out vec2 v_texcoord2;
 void main() {
-    // As the Vulkan path's vertex stage: y is negated for a framebuffer whose flip bit is clear (`flip_viewport`).
-    gl_Position = vec4(a_position.x, u_flip_y != 0 ? -a_position.y : a_position.y, a_position.z, a_position.w);
+    // As the Vulkan path's vertex stage: y is negated for a framebuffer whose flip bit is clear (`flip_viewport`), and
+    // the PICA's z (visible from -w to 0) becomes the ES's depth: Vulkan's NDC is [0, 1] and its depth -z/w, the ES's
+    // NDC is [-1, 1], so the stage writes -2z - w and the depth ends -z/w again (the rule pocket-native's vertex_es
+    // writes for its own stage).
+    gl_Position = vec4(a_position.x, u_flip_y != 0 ? -a_position.y : a_position.y,
+                       -2.0 * a_position.z - a_position.w, a_position.w);
     gl_PointSize = 1.0;
     v_colour = a_colour;
     v_texcoord0 = a_texcoord0;
@@ -702,6 +710,21 @@ struct Surface {
     u64 used = 0;
 };
 
+// A translated PICA vertex stage, compiled for this renderer (DrawVertexProgram), and the key it was made for.
+struct VertexProgram {
+    shader::VertexShaderConfig config;
+    GLuint program = 0;
+    GLuint pica_block = GL_INVALID_INDEX;   // the index of its `vs_pica_data` block (bound to point 0)
+    GLuint data_block = GL_INVALID_INDEX;   // ... and of its `vs_data` block (point 1)
+    Uniforms uniforms;                      // the fragment stage's locations in this program (the same names, new ones)
+    unsigned used_inputs = 0;               // bit r: the stage reads input register r
+    u64 used = 0;                           // when it was last drawn with (the cache's least recently used goes)
+};
+
+// Past this many stages the least recently used program goes: a game has a handful of vertex programs, and a new one
+// costs the driver's compile on the draw that needs it.
+constexpr std::size_t kMaxPrograms = 48;
+
 struct Objects {
     bool built = false;
     Composite composite;
@@ -717,6 +740,12 @@ struct Objects {
     Uniforms uniforms;
     std::unordered_map<u64, Surface> surfaces;  // a colour buffer (address, size) -> its target
     std::unordered_map<u64, GLuint> images;     // a texture's key -> the GL image of its pixels
+    std::vector<VertexProgram> programs;        // the draws' own vertex stages (DrawVertexProgram)
+    GLuint program_vao = 0;                     // ... their vertex array, vertices and the indices of a draw
+    GLuint program_vbo = 0;
+    GLuint program_ibo = 0;
+    GLuint program_ubo = 0;                     // ... and the two uniform blocks of one draw
+    GLuint program_data_ubo = 0;
     std::vector<u8> flipped;                    // the seed, row 0 last (GL's bottom row first)
     std::vector<u8> upload;                     // an image's pixels, row 0 last (the same flip)
 };
@@ -752,6 +781,46 @@ bool Compile(GLenum type, const char* source, GLuint* out, std::string* error) {
     return true;
 }
 
+// Every uniform the combiner's fragment stage reads, by the name it declares them (the locations differ from one
+// program to another: the draws' own vertex stages are linked with the same fragment stage, at their own locations).
+void QueryUniforms(GLuint program, Uniforms* u) {
+    u->source = glGetUniformLocation(program, "u_source[0]");
+    u->modifier = glGetUniformLocation(program, "u_modifier[0]");
+    u->ops = glGetUniformLocation(program, "u_ops[0]");
+    u->scale = glGetUniformLocation(program, "u_scale[0]");
+    u->constant = glGetUniformLocation(program, "u_constant[0]");
+    u->combiner_colour = glGetUniformLocation(program, "u_combiner_colour");
+    u->update_rgb = glGetUniformLocation(program, "u_update_rgb");
+    u->update_alpha = glGetUniformLocation(program, "u_update_alpha");
+    u->alpha_test = glGetUniformLocation(program, "u_alpha_test");
+    u->alpha_func = glGetUniformLocation(program, "u_alpha_func");
+    u->alpha_ref = glGetUniformLocation(program, "u_alpha_ref");
+    u->scissor_mode = glGetUniformLocation(program, "u_scissor_mode");
+    u->scissor = glGetUniformLocation(program, "u_scissor");
+    u->flip_y = glGetUniformLocation(program, "u_flip_y");
+    u->fog_lut = glGetUniformLocation(program, "u_fog_lut");
+    u->fog_mode = glGetUniformLocation(program, "u_fog_mode");
+    u->fog_flip = glGetUniformLocation(program, "u_fog_flip");
+    u->fog_colour = glGetUniformLocation(program, "u_fog_colour");
+    u->proctex = glGetUniformLocation(program, "u_proctex");
+    u->proctex_enable = glGetUniformLocation(program, "u_proctex_enable");
+    u->proctex_config = glGetUniformLocation(program, "u_proctex_config");
+    u->proctex_lut = glGetUniformLocation(program, "u_proctex_lut");
+    u->proctex_offset = glGetUniformLocation(program, "u_proctex_offset");
+    u->proctex_coordinate = glGetUniformLocation(program, "u_proctex_coordinate");
+    u->proctex_amplitude = glGetUniformLocation(program, "u_proctex_amplitude");
+    u->proctex_phase = glGetUniformLocation(program, "u_proctex_phase");
+    u->proctex_frequency = glGetUniformLocation(program, "u_proctex_frequency");
+    for (int unit = 0; unit < 3; ++unit) {
+        const std::string texture = "u_texture" + std::to_string(unit);
+        const std::string has = "u_has_texture" + std::to_string(unit);
+        const std::string coordinate = "u_coordinate" + std::to_string(unit);
+        u->texture[unit] = glGetUniformLocation(program, texture.c_str());
+        u->has_texture[unit] = glGetUniformLocation(program, has.c_str());
+        u->coordinate[unit] = glGetUniformLocation(program, coordinate.c_str());
+    }
+}
+
 bool Build(std::string* error) {
     GLuint vertex = 0, fragment = 0;
     if (!Compile(GL_VERTEX_SHADER, kVertexSource, &vertex, error)) {
@@ -781,42 +850,7 @@ bool Build(std::string* error) {
         return false;
     }
     g_.program = program;
-    Uniforms& u = g_.uniforms;
-    u.source = glGetUniformLocation(program, "u_source[0]");
-    u.modifier = glGetUniformLocation(program, "u_modifier[0]");
-    u.ops = glGetUniformLocation(program, "u_ops[0]");
-    u.scale = glGetUniformLocation(program, "u_scale[0]");
-    u.constant = glGetUniformLocation(program, "u_constant[0]");
-    u.combiner_colour = glGetUniformLocation(program, "u_combiner_colour");
-    u.update_rgb = glGetUniformLocation(program, "u_update_rgb");
-    u.update_alpha = glGetUniformLocation(program, "u_update_alpha");
-    u.alpha_test = glGetUniformLocation(program, "u_alpha_test");
-    u.alpha_func = glGetUniformLocation(program, "u_alpha_func");
-    u.alpha_ref = glGetUniformLocation(program, "u_alpha_ref");
-    u.scissor_mode = glGetUniformLocation(program, "u_scissor_mode");
-    u.scissor = glGetUniformLocation(program, "u_scissor");
-    u.flip_y = glGetUniformLocation(program, "u_flip_y");
-    u.fog_lut = glGetUniformLocation(program, "u_fog_lut");
-    u.fog_mode = glGetUniformLocation(program, "u_fog_mode");
-    u.fog_flip = glGetUniformLocation(program, "u_fog_flip");
-    u.fog_colour = glGetUniformLocation(program, "u_fog_colour");
-    u.proctex = glGetUniformLocation(program, "u_proctex");
-    u.proctex_enable = glGetUniformLocation(program, "u_proctex_enable");
-    u.proctex_config = glGetUniformLocation(program, "u_proctex_config");
-    u.proctex_lut = glGetUniformLocation(program, "u_proctex_lut");
-    u.proctex_offset = glGetUniformLocation(program, "u_proctex_offset");
-    u.proctex_coordinate = glGetUniformLocation(program, "u_proctex_coordinate");
-    u.proctex_amplitude = glGetUniformLocation(program, "u_proctex_amplitude");
-    u.proctex_phase = glGetUniformLocation(program, "u_proctex_phase");
-    u.proctex_frequency = glGetUniformLocation(program, "u_proctex_frequency");
-    for (int unit = 0; unit < 3; ++unit) {
-        const std::string texture = "u_texture" + std::to_string(unit);
-        const std::string has = "u_has_texture" + std::to_string(unit);
-        const std::string coordinate = "u_coordinate" + std::to_string(unit);
-        u.texture[unit] = glGetUniformLocation(program, texture.c_str());
-        u.has_texture[unit] = glGetUniformLocation(program, has.c_str());
-        u.coordinate[unit] = glGetUniformLocation(program, coordinate.c_str());
-    }
+    QueryUniforms(program, &g_.uniforms);
     // The logic op's composite program (a full-screen triangle, no attributes and an empty vertex array).
     GLuint composite_vertex = 0, composite_fragment = 0;
     if (!Compile(GL_VERTEX_SHADER, kCompositeVertexSource, &composite_vertex, error)) {
@@ -1173,8 +1207,7 @@ float HalfToFloat(u32 half) {
 
 // The fog: the mode and its flip and colour as uniforms, the game's 128-entry table as an RG32F texture on unit 3 (the
 // entries are uploaded when they changed). A draw with no table has no fog.
-void SetFog(const FragmentState& fragment) {
-    const Uniforms& u = g_.uniforms;
+void SetFog(const FragmentState& fragment, const Uniforms& u) {
     const bool fog = fragment.fog_lut != nullptr && (fragment.fog_mode & 7) == 5;
     glUniform1i(u.fog_mode, fog ? 5 : 0);
     glUniform1i(u.fog_flip, fragment.fog_flip ? 1 : 0);
@@ -1232,8 +1265,7 @@ u32 ProcTexKey(const ProcTexState& proctex) {
 // The procedural texture (texture unit 3): its registers as uniforms, its tables as a 256x5 RGBA32F texture on unit 4
 // (row 0 noise, 1 colour map, 2 alpha map, 3 the colours, 4 the steps), uploaded when an entry changed. The decoding is
 // lavilao/pocket-native's proctex.rs.
-void SetProcTex(const ProcTexState& proctex) {
-    const Uniforms& u = g_.uniforms;
+void SetProcTex(const ProcTexState& proctex, const Uniforms& u) {
     const bool enable = proctex.enable && proctex.noise_map != nullptr && proctex.color_map != nullptr &&
                         proctex.alpha_map != nullptr && proctex.color_table != nullptr && proctex.color_diff_table != nullptr;
     glUniform1i(u.proctex_enable, enable ? 1 : 0);
@@ -1356,16 +1388,9 @@ void EndFrame(u32 address) {
     }
 }
 
-bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std::string* error) {
-    if (count == 0) {
-        return true;
-    }
-    if (!g_.built || g_.current == nullptr) {
-        *error = "the rasterizer has no target (Begin makes it)";
-        return false;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, g_.current->fbo);
-    glUseProgram(g_.program);
+// The fixed-function state a draw's registers ask for (gles_render.h's DrawState). The caller has bound the target's
+// framebuffer and the program it draws with.
+void ApplyFixedState(const DrawState& state) {
     glViewport(static_cast<GLint>(state.viewport_x), static_cast<GLint>(state.viewport_y),
                static_cast<GLsizei>(state.viewport_width), static_cast<GLsizei>(state.viewport_height));
     if (state.scissor_width != 0 && state.scissor_height != 0) {
@@ -1387,7 +1412,10 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
     SetBlend(state);
     SetCull(state);
 
-    const Uniforms& u = g_.uniforms;
+}
+
+// The fragment stage's uniforms, the three texture units and the tables (the caller has made its program current).
+void ApplyUniforms(const DrawState& state, const Uniforms& u) {
     GLint sources[6], modifiers[6], ops[6], scales[6];
     GLfloat constants[24];
     for (int stage = 0; stage < 6; ++stage) {
@@ -1438,18 +1466,18 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
         glUniform1i(u.has_texture[unit], set ? 1 : 0);
         glUniform1i(u.coordinate[unit], static_cast<GLint>(set ? std::min(state.textures[unit].coordinate, 2u) : 0u));
     }
-    SetFog(state.fragment);
-    SetProcTex(state.fragment.proctex);
+    SetFog(state.fragment, u);
+    SetProcTex(state.fragment.proctex, u);
+}
 
+// Issues a draw into the current surface, with the logic op emulated where GLES has none: `issue` draws the geometry,
+// its vertices already bound.
+bool Submit(const DrawState& state, const std::function<void()>& issue, std::string* error) {
     Surface& surface = *g_.current;
     const GLsizei w = static_cast<GLsizei>(surface.target.width);
     const GLsizei h = static_cast<GLsizei>(surface.target.height);
     const bool logic = state.logic_op != 3 && state.logic_op != 6;
     const bool emulate = logic && surface.source_ok && surface.has_stencil && g_.composite.program != 0;
-    glBindVertexArray(g_.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g_.vbo);
-    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(static_cast<std::size_t>(count) * kVertexStride), vertices,
-                 GL_STREAM_DRAW);
     if (emulate) {
         // The draw goes into the source texture; the depth test writes the depth buffer the two framebuffers share, and
         // the stencil marks the pixels that passed, so the composite leaves the others as they were.
@@ -1466,7 +1494,7 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
         glEnable(GL_STENCIL_TEST);
         glStencilFunc(GL_ALWAYS, 1, 0xFF);
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count));
+        issue();
         glDisable(GL_STENCIL_TEST);
         // Then the composite: a copy of the target's pixels, the source, and the op, over the marked pixels only.
         glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
@@ -1500,7 +1528,7 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
             // NoOp writes no colour; the draw's depth write stays (as the Vulkan path's colour write mask of 0 keeps it).
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
         }
-        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count));
+        issue();
     }
     const GLenum error_gl = glGetError();
     if (error_gl != GL_NO_ERROR) {
@@ -1510,6 +1538,293 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
         return false;
     }
     return true;
+}
+
+// ---- the draws' own vertex stages (DrawVertexProgram) ---------------------------------------------------------
+
+namespace {
+
+// A vertex format's GL type, lane count and whether the stage reads it as an integer (vertex_loader.h's conversion).
+struct GlVertexFormat {
+    GLenum type = GL_FLOAT;
+    GLint size = 4;
+    bool integer = false;
+};
+
+GlVertexFormat GlFormatOf(vertex::VertexFormat format) {
+    switch (format) {
+    case vertex::VertexFormat::R8_SINT:
+        return {GL_BYTE, 1, true};
+    case vertex::VertexFormat::R8G8_SINT:
+        return {GL_BYTE, 2, true};
+    case vertex::VertexFormat::R8G8B8A8_SINT:
+        return {GL_BYTE, 4, true};
+    case vertex::VertexFormat::R8_UINT:
+        return {GL_UNSIGNED_BYTE, 1, true};
+    case vertex::VertexFormat::R8G8_UINT:
+        return {GL_UNSIGNED_BYTE, 2, true};
+    case vertex::VertexFormat::R8G8B8A8_UINT:
+        return {GL_UNSIGNED_BYTE, 4, true};
+    case vertex::VertexFormat::R16_SINT:
+        return {GL_SHORT, 1, true};
+    case vertex::VertexFormat::R16G16_SINT:
+        return {GL_SHORT, 2, true};
+    case vertex::VertexFormat::R16G16B16A16_SINT:
+        return {GL_SHORT, 4, true};
+    case vertex::VertexFormat::R32_FLOAT:
+        return {GL_FLOAT, 1, false};
+    case vertex::VertexFormat::R32G32_FLOAT:
+        return {GL_FLOAT, 2, false};
+    case vertex::VertexFormat::R32G32B32_FLOAT:
+        return {GL_FLOAT, 3, false};
+    case vertex::VertexFormat::R32G32B32A32_FLOAT:
+        break;
+    }
+    return {GL_FLOAT, 4, false};
+}
+
+// The stage for `config`, translated and compiled (a miss pays the driver's compile: the draw that needs it).
+bool MakeVertexProgram(const pica::PicaState& state, const shader::VertexShaderConfig& config, VertexProgram* out,
+                       std::string* error) {
+    shader::TranslateResult translated = shader::GenerateVertexGlsl(state.vs, config);
+    if (!translated.ok()) {
+        *error = translated.error;
+        return false;
+    }
+    std::string es;
+    if (!ToEsVertexStage(translated.shader->glsl, &es, error)) {
+        return false;
+    }
+    GLuint vertex = 0, fragment = 0;
+    if (!Compile(GL_VERTEX_SHADER, es.c_str(), &vertex, error)) {
+        return false;
+    }
+    if (!Compile(GL_FRAGMENT_SHADER, kFragmentSource, &fragment, error)) {
+        glDeleteShader(vertex);
+        return false;
+    }
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    // The fragment program's varyings are the stage's, by name (gles_shader.h), so the two link as they are.
+    glLinkProgram(program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    GLint ok = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        GLint length = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
+        std::string text(length > 1 ? static_cast<std::size_t>(length) : 0, '\0');
+        if (length > 1) {
+            glGetProgramInfoLog(program, length, nullptr, text.data());
+        }
+        *error = "the translated vertex stage did not link with the fragment stage: " + text;
+        glDeleteProgram(program);
+        return false;
+    }
+    const GLuint pica_block = glGetUniformBlockIndex(program, "vs_pica_data");
+    const GLuint data_block = glGetUniformBlockIndex(program, "vs_data");
+    if (pica_block == GL_INVALID_INDEX || data_block == GL_INVALID_INDEX) {
+        *error = "the translated vertex stage has no uniform blocks to bind";
+        glDeleteProgram(program);
+        return false;
+    }
+    QueryUniforms(program, &out->uniforms);
+    glUniformBlockBinding(program, pica_block, 0);
+    glUniformBlockBinding(program, data_block, 1);
+    out->program = program;
+    out->pica_block = pica_block;
+    out->data_block = data_block;
+    out->used_inputs = translated.shader->used_inputs;
+    return true;
+}
+
+// The draw's indices with its base vertex added (GLES 3.1 has no base-vertex draw; vertex_loader.h gives the list
+// relative to buffer vertex 0).
+void MakeIndices(const vertex::LoadedDraw& loaded, std::vector<u8>& out, GLenum* type) {
+    const vertex::IndexType kind = loaded.index_type;
+    const std::size_t size = kind == vertex::IndexType::U8 ? 1 : kind == vertex::IndexType::U16 ? 2 : 4;
+    *type = kind == vertex::IndexType::U8 ? GL_UNSIGNED_BYTE
+            : kind == vertex::IndexType::U16 ? GL_UNSIGNED_SHORT
+                                             : GL_UNSIGNED_INT;
+    out.resize(static_cast<std::size_t>(loaded.count) * size);
+    for (u32 i = 0; i < loaded.count; ++i) {
+        u32 value = 0;
+        std::memcpy(&value, loaded.index_data.data() + static_cast<std::size_t>(i) * size, size);
+        // (the loader's base vertex is signed: an index below the first vertex of the draw stays at the first)
+        s32 moved = static_cast<s32>(value) + loaded.base_vertex;
+        moved = std::max(0, moved);
+        if (size == 1) {
+            out[i] = static_cast<u8>(std::min(moved, 255));
+        } else if (size == 2) {
+            const u16 entry = static_cast<u16>(std::min(moved, 65535));
+            std::memcpy(&out[static_cast<std::size_t>(i) * 2], &entry, 2);
+        } else {
+            const u32 entry = static_cast<u32>(moved);
+            std::memcpy(&out[static_cast<std::size_t>(i) * 4], &entry, 4);
+        }
+    }
+}
+
+}  // namespace
+
+bool DrawVertexProgram(const VertexDraw& draw, const DrawState& state, std::string* error) {
+    if (!g_.built || g_.current == nullptr) {
+        *error = "the rasterizer has no target (Begin makes it)";
+        return false;
+    }
+    if (draw.state == nullptr || draw.loaded == nullptr) {
+        *error = "the draw has no vertex stage of its own";
+        return false;
+    }
+    const vertex::LoadedDraw& loaded = *draw.loaded;
+    const pica::PicaState& pica_state = *draw.state;
+    if (loaded.count == 0) {
+        return true;
+    }
+    if (loaded.topology == vertex::Topology::Shader) {
+        *error = "a shader topology's primitives come from the geometry stage, which this renderer has not";
+        return false;
+    }
+    if (loaded.buffers.empty()) {
+        *error = "the draw has no vertex buffer to read";
+        return false;
+    }
+
+    // The stage: the draw's own PICA program, without the clip distances GLSL ES has not (gles_shader.h).
+    shader::ConfigOptions options;
+    options.use_clip_planes = false;
+    options.geometry_stage = false;
+    options.capture_outputs = false;
+    options.exact_arithmetic = true;
+    const shader::VertexShaderConfig config = shader::MakeVertexShaderConfig(pica_state, &loaded, options);
+    VertexProgram* stage = nullptr;
+    for (VertexProgram& candidate : g_.programs) {
+        if (candidate.config == config) {
+            stage = &candidate;
+            break;
+        }
+    }
+    if (stage == nullptr) {
+        VertexProgram made;
+        made.config = config;
+        if (!MakeVertexProgram(pica_state, config, &made, error)) {
+            return false;  // (the caller takes the CPU path: a program this renderer cannot run is never fatal)
+        }
+        if (g_.programs.size() >= kMaxPrograms) {
+            auto oldest = std::min_element(g_.programs.begin(), g_.programs.end(),
+                                           [](const VertexProgram& a, const VertexProgram& b) { return a.used < b.used; });
+            glDeleteProgram(oldest->program);
+            *oldest = made;
+            stage = &*oldest;
+        } else {
+            g_.programs.push_back(made);
+            stage = &g_.programs.back();
+        }
+    }
+    stage->used = ++g_.clock;
+
+    // The two uniform blocks of the draw (vertex_shader.h: PicaUniformData, then VertexUniformData).
+    struct Blocks {
+        shader::PicaUniformData pica;
+        shader::VertexUniformData data;
+    };
+    static thread_local Blocks blocks;
+    shader::WritePicaUniformData(pica_state.vs, &blocks.pica);
+    blocks.data = shader::MakeVertexUniformData(pica_state, state.flipped);
+    if (g_.program_ubo == 0) {
+        glGenBuffers(1, &g_.program_ubo);
+        glGenBuffers(1, &g_.program_data_ubo);
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, g_.program_ubo);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(blocks.pica), &blocks.pica, GL_STREAM_DRAW);
+    glBindBuffer(GL_UNIFORM_BUFFER, g_.program_data_ubo);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(blocks.data), &blocks.data, GL_STREAM_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, g_.program_ubo);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 1, g_.program_data_ubo);
+
+    // The vertices: the loader's bindings one after another in one buffer, each attribute where its binding puts it
+    // (vertex_loader.h: the strides are the loader's, the offsets the attributes').
+    static thread_local std::vector<u8> vertices;
+    static thread_local std::vector<u32> starts;
+    vertices.clear();
+    starts.assign(loaded.buffers.size(), 0);
+    for (std::size_t b = 0; b < loaded.buffers.size(); ++b) {
+        const vertex::VertexBuffer& buffer = loaded.buffers[b];
+        starts[b] = static_cast<u32>(vertices.size());
+        vertices.insert(vertices.end(), buffer.data.begin(), buffer.data.end());
+    }
+    if (g_.program_vao == 0) {
+        glGenVertexArrays(1, &g_.program_vao);
+        glGenBuffers(1, &g_.program_vbo);
+        glGenBuffers(1, &g_.program_ibo);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_.current->fbo);
+    glUseProgram(stage->program);
+    ApplyFixedState(state);
+    ApplyUniforms(state, stage->uniforms);
+    glBindVertexArray(g_.program_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_.program_vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size()), vertices.data(), GL_STREAM_DRAW);
+    for (u32 r = 0; r < 16; ++r) {
+        const bool used = (stage->used_inputs & (1u << r)) != 0;
+        const vertex::VertexAttribute& attribute = loaded.attributes[r];
+        if (!used || attribute.binding >= loaded.buffers.size()) {
+            glDisableVertexAttribArray(r);
+            continue;
+        }
+        const vertex::VertexBuffer& buffer = loaded.buffers[attribute.binding];
+        const GlVertexFormat format = GlFormatOf(attribute.format);
+        const void* offset = reinterpret_cast<const void*>(
+            static_cast<std::uintptr_t>(starts[attribute.binding] + attribute.offset));
+        glVertexAttribDivisor(r, buffer.per_instance ? 1 : 0);
+        if (format.integer) {
+            glVertexAttribIPointer(r, format.size, format.type, static_cast<GLsizei>(buffer.stride), offset);
+        } else {
+            glVertexAttribPointer(r, format.size, format.type, GL_FALSE, static_cast<GLsizei>(buffer.stride), offset);
+        }
+        glEnableVertexAttribArray(r);
+    }
+
+    const GLenum mode = loaded.topology == vertex::Topology::TriangleStrip
+                            ? GL_TRIANGLE_STRIP
+                            : loaded.topology == vertex::Topology::TriangleFan ? GL_TRIANGLE_FAN : GL_TRIANGLES;
+    if (loaded.index_type == vertex::IndexType::None) {
+        const GLsizei count = static_cast<GLsizei>(loaded.count);
+        return Submit(state, [mode, count] { glDrawArrays(mode, 0, count); }, error);
+    }
+    static thread_local std::vector<u8> indices;
+    GLenum index_type = GL_UNSIGNED_SHORT;
+    MakeIndices(loaded, indices, &index_type);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_.program_ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(indices.size()), indices.data(), GL_STREAM_DRAW);
+    const GLsizei count = static_cast<GLsizei>(loaded.count);
+    return Submit(
+        state,
+        [mode, index_type, count] {
+            glDrawElements(mode, count, index_type, nullptr);
+        },
+        error);
+}
+
+bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std::string* error) {
+    if (count == 0) {
+        return true;
+    }
+    if (!g_.built || g_.current == nullptr) {
+        *error = "the rasterizer has no target (Begin makes it)";
+        return false;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_.current->fbo);
+    glUseProgram(g_.program);
+    ApplyFixedState(state);
+    ApplyUniforms(state, g_.uniforms);
+    glBindVertexArray(g_.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_.vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(static_cast<std::size_t>(count) * kVertexStride), vertices,
+                 GL_STREAM_DRAW);
+    return Submit(state, [count] { glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count)); }, error);
 }
 
 bool ReadTarget(u32 address, std::vector<u8>& out, u32* width, u32* height, std::string* error) {
@@ -1586,6 +1901,22 @@ void Forget() {
         DeleteSurface(surface);
     }
     g_.surfaces.clear();
+    for (VertexProgram& stage : g_.programs) {
+        GLuint gone = stage.program;
+        glDeleteProgram(gone);
+    }
+    g_.programs.clear();
+    for (GLuint* buffer : {&g_.program_vbo, &g_.program_ibo, &g_.program_ubo, &g_.program_data_ubo}) {
+        if (*buffer != 0) {
+            glDeleteBuffers(1, buffer);
+            *buffer = 0;
+        }
+    }
+    if (g_.program_vao != 0) {
+        GLuint gone = g_.program_vao;
+        glDeleteVertexArrays(1, &gone);
+        g_.program_vao = 0;
+    }
     GLuint vao = g_.vao, vbo = g_.vbo, program = g_.program, fog_lut = g_.fog_lut, proctex = g_.proctex;
     GLuint composite_vao = g_.composite.vao, composite_program = g_.composite.program;
     glDeleteVertexArrays(1, &vao);
@@ -1626,6 +1957,11 @@ bool Begin(const Target&, const TargetContents*, std::string* error) {
 void EndFrame(u32) {}
 
 bool DrawTriangles(const void*, u32, const DrawState&, std::string* error) {
+    *error = kNoGles;
+    return false;
+}
+
+bool DrawVertexProgram(const VertexDraw&, const DrawState&, std::string* error) {
     *error = kNoGles;
     return false;
 }

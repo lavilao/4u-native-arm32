@@ -1,8 +1,16 @@
 // The GLES rasterizer of the alternative renderer (gpu/gles): the triangles the CPU has already placed, drawn by the
 // GPU's pixels' worth, as lavilao/pocket-native's raster/gles does it.
 //
-// The vertex stage passes the batch through (its positions are clip space already, gles_draw.h's recipe) and hands the
-// fragment stage the colour and the three texture coordinates. The fragment stage is the PICA's own: the six combiner
+// Two vertex stages draw with it:
+//
+//   the batch      the CPU vertex unit's triangles (triangle_batch.h): positions in clip space already, drawn by a
+//                  trivial stage that passes them through (gles_draw.h's recipe for the draws it cannot accelerate)
+//   the draw's own a draw Azahar accelerates keeps its own PICA vertex program, translated to GLSL ES 3.10 and run by
+//                  the phone's GPU over the draw's vertex buffers and index list (DrawVertexProgram, gles_shader.h):
+//                  the transform, the vertex colours, the texture coordinates and the quaternions are the GPU's work,
+//                  as lavilao/pocket-native's raster/gles does it
+//
+// Both hand the fragment stage the colour and the three texture coordinates. The fragment stage is the PICA's own: the six combiner
 // (TEV) stages, read from uniforms, over the primary colour, the three texture units, the previous stage's output, the
 // combiner buffer and the stages' constant colours; the alpha test; the fog, from the table the game filled; and the
 // logic op (drawn into a source texture and composited, GLES having none) and the procedural texture, whose tables the
@@ -17,6 +25,8 @@
 #include <string>
 #include <vector>
 
+#include "gpu/pica/state.h"
+#include "gpu/vertex/vertex_loader.h"
 #include "mh4n/types.h"
 
 namespace mh4n::gpu::gles::render {
@@ -155,6 +165,18 @@ bool Begin(const Target& target, const TargetContents* contents, std::string* er
 
 // Draws `count` vertices of the batch (triangle_batch.h's HardwareVertex layout, 88 bytes each) in triangles.
 bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std::string* error);
+
+// A draw whose vertex stage is the PICA's own program, translated to GLSL ES and run by the phone's GPU over the draw's
+// vertex buffers, as lavilao/pocket-native's raster/gles does (instead of the CPU vertex unit's triangles).
+struct VertexDraw {
+    const pica::PicaState* state = nullptr;      // the processor's state at the draw: its vertex program and registers
+    const vertex::LoadedDraw* loaded = nullptr;  // the draw's attributes, vertex buffers and indices (vertex_loader.h)
+};
+
+// Draws `draw` with the fragment state `state`. False, with `error`, when this draw cannot go that way — a program the
+// translator or the driver refused, a topology or an attribute this has not — in which case the caller takes the CPU
+// path, which always draws it.
+bool DrawVertexProgram(const VertexDraw& draw, const DrawState& state, std::string* error);
 
 // The screen's frame is over (the game swapped the colour buffer at `address`): that buffer's pass ends, so the next
 // draw into it starts from the picture guest memory holds then.

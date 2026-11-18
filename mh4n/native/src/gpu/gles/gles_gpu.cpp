@@ -104,6 +104,12 @@ void GlesGpu::WriteBack(u32 screen) {
         if (++writebacks_ == 1) {
             MH4N_LOG(Info, kLog, "the picture is written back into guest memory ({}x{}, screen {})", target.width,
                      target.height, screen);
+            // What the first frame drew and how: the draws' own vertex stages on the GPU, and the CPU's for the rest.
+            const DrawStats& stats = drawer_.GetStats();
+            MH4N_LOG(Info, kLog, "{} draws so far: {} on the GPU's vertex stage, {} on the CPU's, {} refused by it, {} "
+                                 "triangles; {}",
+                     stats.draws, stats.gpu_draws, stats.cpu_draws, stats.gpu_failures, stats.triangles,
+                     render::Describe());
         }
         return;
     }
