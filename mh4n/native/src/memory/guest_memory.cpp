@@ -6,6 +6,8 @@
 // Copyright 2015-2024 Citra Emulator Project / Azahar Emulator Project (vm_manager.cpp)
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (gpu.cpp)
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 
 #include "host.h"
@@ -34,7 +36,89 @@ constexpr u64 AlignUp(u64 value, u64 alignment) {
 constexpr u32 kLinearHeapSize = 0x08000000;
 constexpr u32 kNewLinearHeapSize = 0x10000000;
 
+// The address space the app took at startup (ReserveGuestAddressSpaceEarly). The first GuestMemory
+// adopts it; anything the app did after that (SDL, EGL, the GPU driver) cannot have used it.
+void* g_early_base = nullptr;
+std::size_t g_early_size = 0;
+
+void* TakeEarlyReservation(std::size_t size) {
+    if (g_early_base == nullptr) {
+        return nullptr;
+    }
+    void* base = g_early_base;
+    const std::size_t taken = g_early_size;
+    g_early_base = nullptr;
+    g_early_size = 0;
+    if (taken != size) {
+        host::Release(base, taken); // a size the runtime no longer wants
+        return nullptr;
+    }
+    return base;
+}
+
+// What the app's address space still holds free, for the line a failed reservation leaves: the
+// largest hole and where it starts, the total mapped and where the last mapping ends. A 32-bit
+// build counts the space above the last mapping too (Android's 32-bit userspace ends at
+// 0xC0000000, and nothing maps there); pocket-native logs the same after its own reservation.
+void LogAddressSpaceFree() {
+#if defined(__linux__)
+    std::FILE* file = std::fopen("/proc/self/maps", "re");
+    if (file == nullptr) {
+        return;
+    }
+    unsigned long best = 0, best_at = 0, total = 0, end = 0;
+    char line[512];
+    while (std::fgets(line, sizeof line, file) != nullptr) {
+        unsigned long lo = 0, hi = 0;
+        if (std::sscanf(line, "%lx-%lx", &lo, &hi) != 2 || hi < lo) {
+            continue;
+        }
+        if (lo > end && lo - end > best) {
+            best = lo - end;
+            best_at = end;
+        }
+        total += hi - lo;
+        if (hi > end) {
+            end = hi;
+        }
+    }
+    std::fclose(file);
+#if !defined(__LP64__)
+    constexpr unsigned long kUserSpaceEnd = 0xC0000000ul;
+    if (end < kUserSpaceEnd && kUserSpaceEnd - end > best) {
+        best = kUserSpaceEnd - end;
+        best_at = end;
+    }
+#endif
+    MH4N_LOG(Error, "Memory",
+             "the app's address space: its largest free hole is {} MiB at 0x{:08x} ({} MiB mapped, "
+             "the last mapping ends at 0x{:08x})",
+             static_cast<unsigned>(best >> 20), static_cast<u32>(best_at),
+             static_cast<unsigned>(total >> 20), static_cast<u32>(end));
+#endif
+}
+
 } // namespace
+
+void ReserveGuestAddressSpaceEarly() {
+    if (g_early_base != nullptr) {
+        return;
+    }
+    const std::size_t size = static_cast<std::size_t>(kAddressSpaceSize + kGuardSize);
+    void* base = host::Reserve(size);
+    if (base == nullptr) {
+        MH4N_LOG(Warning, "Memory",
+                 "the guest's {} MiB are not taken at startup ({}); the runtime asks again later",
+                 static_cast<unsigned>(size >> 20), std::strerror(errno));
+        LogAddressSpaceFree();
+        return;
+    }
+    g_early_base = base;
+    g_early_size = size;
+    MH4N_LOG(Info, "Memory", "the guest's {} MiB of address space are taken at startup, at 0x{:08x}",
+             static_cast<unsigned>(size >> 20),
+             static_cast<u32>(reinterpret_cast<std::uintptr_t>(base)));
+}
 
 const std::vector<ZeroRegion>& DefaultZeroRegions() {
     static const std::vector<ZeroRegion> regions(std::begin(kEmbeddedZeroRegions),
@@ -78,13 +162,22 @@ bool GuestMemory::Init(const GuestMemoryOptions& options) {
     }
 
     reservation_size_ = static_cast<std::size_t>(kAddressSpaceSize + kGuardSize);
-    void* reserved = host::Reserve(reservation_size_);
+    void* reserved = TakeEarlyReservation(reservation_size_);
+    const bool early = reserved != nullptr;
     if (reserved == nullptr) {
-        MH4N_LOG(Error, "Memory", "cannot reserve {} MiB of address space for the guest",
-                 reservation_size_ >> 20);
-        return false;
+        reserved = host::Reserve(reservation_size_);
+        if (reserved == nullptr) {
+            MH4N_LOG(Error, "Memory", "cannot reserve {} MiB of address space for the guest ({})",
+                     reservation_size_ >> 20, std::strerror(errno));
+            LogAddressSpaceFree();
+            return false;
+        }
     }
     base_ = static_cast<u8*>(reserved);
+    MH4N_LOG(Info, "Memory", "the guest's {} MiB of address space at 0x{:08x} ({})",
+             reservation_size_ >> 20,
+             static_cast<u32>(reinterpret_cast<std::uintptr_t>(base_)),
+             early ? "taken at startup" : "reserved now");
     if (!fault::RegisterReservation(reinterpret_cast<std::uintptr_t>(base_), reservation_size_)) {
         MH4N_LOG(Error, "Memory", "too many guest memories");
         return false; // the destructor releases the reservation

@@ -188,6 +188,15 @@ void SetFatalHook(FatalHook hook);
 
 inline constexpr u64 kNoBacking = ~0ull;
 
+// Takes the guest's address space (kAddressSpaceSize plus the guard) now, before anything else in
+// the process has a share of it: the app calls this first thing in main. A 32-bit phone gives the
+// process about 3 GiB of address space, and by the time the runtime starts, SDL, EGL and the GPU
+// driver have fragmented it (a Redmi 9A: some 2800 map entries, no 1 GiB hole left), so the ask
+// then fails and the app never starts. The first GuestMemory adopts the reservation instead of
+// asking for one; without an early reservation it asks as before. Safe to call more than once; a
+// failure is logged with the space that is left, and Create() tries again later.
+void ReserveGuestAddressSpaceEarly();
+
 class GuestMemory {
 public:
     // Reserves 4 GiB plus a 64 KiB guard (inaccessible, nothing committed), installs the fault

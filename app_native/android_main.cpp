@@ -66,6 +66,7 @@
 #include "mh4n/host.h"
 #include "mh4n/host_thread_name.h"
 #include "mh4n/log.h"
+#include "mh4n/memory.h"
 #include "mh4n/options.h"
 #include "mh4n/pacing_trace.h"
 #include "mh4n/present.h"
@@ -418,6 +419,11 @@ Layout ComputeLayout(int w, int h, u32 top_w, u32 top_h, u32 bot_w, u32 bot_h, b
 int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
+    // The guest's 1 GiB of address space first, before SDL, EGL, the GPU driver, ImGui's fonts and everything else
+    // have their share of a 32-bit phone's ~3 GiB: by the time the runtime starts, no 1 GiB hole is left (a Redmi 9A:
+    // "cannot reserve 1024 MiB of address space for the guest", some 2800 map entries). pocket-native reserves its
+    // view here for the same reason. On a 64-bit host the 4 GiB are just as easy to take now.
+    mh4n::ReserveGuestAddressSpaceEarly();
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO | SDL_INIT_EVENTS | SDL_INIT_SENSOR)) {  // (sensors: the gyro's aim)
