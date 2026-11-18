@@ -93,6 +93,9 @@ out vec4 o_colour;
 float byteround(float x) {
     return round(clamp(x, 0.0, 1.0) * 255.0) / 255.0;
 }
+vec3 byteround(vec3 x) {
+    return vec3(byteround(x.x), byteround(x.y), byteround(x.z));
+}
 vec4 byteround(vec4 x) {
     return vec4(byteround(x.x), byteround(x.y), byteround(x.z), byteround(x.w));
 }
@@ -308,11 +311,11 @@ void main() {
     vec4 held = vec4(0.0);                // combiner_buffer
     vec4 next_buffer = u_combiner_colour; // next_combiner_buffer
     for (int stage = 0; stage < 6; ++stage) {
-        const int sources = u_source[stage];
-        const int modifiers = u_modifier[stage];
-        const int ops = u_ops[stage];
-        const int scales = u_scale[stage];
-        const vec4 constant_colour = u_constant[stage];
+        int sources = u_source[stage];
+        int modifiers = u_modifier[stage];
+        int ops = u_ops[stage];
+        int scales = u_scale[stage];
+        vec4 constant_colour = u_constant[stage];
         int source[3];
         int modifier[3];
         source[0] = sources & 0xF;
@@ -336,8 +339,8 @@ void main() {
                                                 texture0, texture1, texture2),
                                       modifier[i]);
         }
-        const int color_op = ops & 0xF;
-        const int alpha_op = (ops >> 16) & 0xF;
+        int color_op = ops & 0xF;
+        int alpha_op = (ops >> 16) & 0xF;
         vec3 color_output = byteround(ColorCombiner(color_op, colors[0], colors[1], colors[2]));
         float alpha_output = 0.0;
         if (color_op == 7) {
@@ -386,17 +389,85 @@ void main() {
     // The fog (FogMode::Fog): the table the game filled turns the fragment's depth into a factor; the colour is mixed
     // towards the fog colour by it (gpu/fragment/fog/fog.cpp's WriteFog).
     if (u_fog_mode == 5) {
-        const float fog_depth = clamp(gl_FragCoord.z, 0.0, 1.0);
-        const float fog_index = (u_fog_flip != 0 ? (1.0 - fog_depth) : fog_depth) * 128.0;
-        const float fog_i = clamp(floor(fog_index), 0.0, 127.0);
-        const float fog_f = fog_index - fog_i;
-        const vec2 entry = texelFetch(u_fog_lut, ivec2(int(fog_i), 0), 0).rg;
-        const float fog_factor = clamp(entry.r + entry.g * fog_f, 0.0, 1.0);
+        float fog_depth = clamp(gl_FragCoord.z, 0.0, 1.0);
+        float fog_index = (u_fog_flip != 0 ? (1.0 - fog_depth) : fog_depth) * 128.0;
+        float fog_i = clamp(floor(fog_index), 0.0, 127.0);
+        float fog_f = fog_index - fog_i;
+        vec2 entry = texelFetch(u_fog_lut, ivec2(int(fog_i), 0), 0).rg;
+        float fog_factor = clamp(entry.r + entry.g * fog_f, 0.0, 1.0);
         previous.rgb = mix(u_fog_colour, previous.rgb, fog_factor);
     }
     o_colour = previous;
 }
 )";
+
+// The composite of a logic op: a full-screen triangle (no attributes: gl_VertexID places it) that reads the draw's source
+// texture and a copy of the target's pixels, applies the PICA's bit-by-bit op, and writes the result. Only the pixels the
+// draw covered are touched (the stencil buffer carries that, see Surface).
+constexpr const char* kCompositeVertexSource = R"(#version 310 es
+void main() {
+    vec2 corner = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+// Azahar's LogicOp on the 8-bit values (gpu/fbops/output_stage.glsl's mh4n_logic_op): Clear 0, And 1, AndReverse 2,
+// Copy 3, Set 4, CopyInverted 5, NoOp 6, Invert 7, Nand 8, Or 9, Nor 10, Xor 11, Equiv 12, AndInverted 13, OrReverse 14,
+// OrInverted 15.
+constexpr const char* kCompositeFragmentSource = R"(#version 310 es
+precision highp float;
+uniform sampler2D u_source;
+uniform sampler2D u_destination;
+uniform int u_logic_op;
+out vec4 o_colour;
+vec4 LogicOp(int op, vec4 src, vec4 dst) {
+    uvec4 s = uvec4(clamp(floor(src * 255.0 + 0.5), 0.0, 255.0));
+    uvec4 d = uvec4(clamp(floor(dst * 255.0 + 0.5), 0.0, 255.0));
+    uvec4 r = s;
+    if (op == 0) {
+        r = uvec4(0u);
+    } else if (op == 1) {
+        r = s & d;
+    } else if (op == 2) {
+        r = s & ~d;
+    } else if (op == 3) {
+        r = s;
+    } else if (op == 4) {
+        r = uvec4(255u);
+    } else if (op == 5) {
+        r = ~s;
+    } else if (op == 7) {
+        r = ~d;
+    } else if (op == 8) {
+        r = ~(s & d);
+    } else if (op == 9) {
+        r = s | d;
+    } else if (op == 10) {
+        r = ~(s | d);
+    } else if (op == 11) {
+        r = s ^ d;
+    } else if (op == 12) {
+        r = ~(s ^ d);
+    } else if (op == 13) {
+        r = ~s & d;
+    } else if (op == 14) {
+        r = s | ~d;
+    } else if (op == 15) {
+        r = ~s | d;
+    }
+    return vec4(r & 255u) / 255.0;
+}
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    o_colour = LogicOp(u_logic_op, texelFetch(u_source, at, 0), texelFetch(u_destination, at, 0));
+}
+)";
+
+struct Composite {
+    GLuint program = 0;
+    GLuint vao = 0;
+    GLint source = -1, destination = -1, op = -1;
+};
 
 struct Uniforms {
     GLint source = -1, modifier = -1, ops = -1, scale = -1, constant = -1;
@@ -413,6 +484,13 @@ struct Surface {
     GLuint fbo = 0;
     GLuint colour = 0;
     GLuint depth = 0;
+    // A logic op's draw goes into `source` (its own framebuffer, sharing the depth buffer, so the depth test and write
+    // happen once); the composite reads `source` and `destination` (a copy of the target's pixels) and writes the target.
+    GLuint source = 0;
+    GLuint source_fbo = 0;
+    GLuint destination = 0;
+    bool has_stencil = false;    // the depth buffer carries a stencil, where the composite finds the covered pixels
+    bool source_ok = false;      // the source framebuffer is complete
     Target target;
     bool live = false;
     u64 used = 0;
@@ -420,6 +498,7 @@ struct Surface {
 
 struct Objects {
     bool built = false;
+    Composite composite;
     GLuint program = 0;
     GLuint vao = 0;
     GLuint vbo = 0;
@@ -517,6 +596,33 @@ bool Build(std::string* error) {
         u.has_texture[unit] = glGetUniformLocation(program, has.c_str());
         u.coordinate[unit] = glGetUniformLocation(program, coordinate.c_str());
     }
+    // The logic op's composite program (a full-screen triangle, no attributes and an empty vertex array).
+    GLuint composite_vertex = 0, composite_fragment = 0;
+    if (!Compile(GL_VERTEX_SHADER, kCompositeVertexSource, &composite_vertex, error)) {
+        return false;
+    }
+    if (!Compile(GL_FRAGMENT_SHADER, kCompositeFragmentSource, &composite_fragment, error)) {
+        glDeleteShader(composite_vertex);
+        return false;
+    }
+    const GLuint composite = glCreateProgram();
+    glAttachShader(composite, composite_vertex);
+    glAttachShader(composite, composite_fragment);
+    glLinkProgram(composite);
+    glDeleteShader(composite_vertex);
+    glDeleteShader(composite_fragment);
+    ok = GL_FALSE;
+    glGetProgramiv(composite, GL_LINK_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        *error = "the logic op's program did not link";
+        glDeleteProgram(composite);
+        return false;
+    }
+    g_.composite.program = composite;
+    g_.composite.source = glGetUniformLocation(composite, "u_source");
+    g_.composite.destination = glGetUniformLocation(composite, "u_destination");
+    g_.composite.op = glGetUniformLocation(composite, "u_logic_op");
+    glGenVertexArrays(1, &g_.composite.vao);
     glGenVertexArrays(1, &g_.vao);
     glGenBuffers(1, &g_.vbo);
     glBindVertexArray(g_.vao);
@@ -563,8 +669,13 @@ void DeleteSurface(Surface& surface) {
     if (surface.fbo != 0) {
         glDeleteFramebuffers(1, &surface.fbo);
     }
-    if (surface.colour != 0) {
-        glDeleteTextures(1, &surface.colour);
+    if (surface.source_fbo != 0) {
+        glDeleteFramebuffers(1, &surface.source_fbo);
+    }
+    for (GLuint* texture : {&surface.colour, &surface.source, &surface.destination}) {
+        if (*texture != 0) {
+            glDeleteTextures(1, texture);
+        }
     }
     if (surface.depth != 0) {
         glDeleteRenderbuffers(1, &surface.depth);
@@ -594,15 +705,22 @@ bool MakeAttachments(Surface& surface, std::string* error) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, surface.colour, 0);
-    const GLenum depth_formats[] = {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT16};
+    // The depth buffer the 3D draws test against: with a stencil where the driver makes one (the logic op's composite
+    // uses it to know the pixels the draw covered), else depth alone. 24 bits where offered, 16 where not.
+    const GLenum depth_formats[] = {GL_DEPTH24_STENCIL8, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT16};
     GLenum status = GL_FRAMEBUFFER_UNSUPPORTED;
+    GLenum attachment = GL_DEPTH_ATTACHMENT;
     for (const GLenum format : depth_formats) {
+        const bool stencil = format == GL_DEPTH24_STENCIL8;
         glBindRenderbuffer(GL_RENDERBUFFER, surface.depth);
         glRenderbufferStorage(GL_RENDERBUFFER, format, static_cast<GLsizei>(target.width),
                               static_cast<GLsizei>(target.height));
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, surface.depth);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
+                                  GL_RENDERBUFFER, surface.depth);
         status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (status == GL_FRAMEBUFFER_COMPLETE) {
+            surface.has_stencil = stencil;
+            attachment = stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
             break;
         }
     }
@@ -613,6 +731,28 @@ bool MakeAttachments(Surface& surface, std::string* error) {
         *error = why;
         return false;
     }
+    // The logic op's two textures, and the framebuffer its draw goes into (same depth buffer, so one depth test and one
+    // depth write per draw).
+    surface.source_ok = false;
+    if (surface.source == 0) {
+        glGenTextures(1, &surface.source);
+        glGenTextures(1, &surface.destination);
+        glGenFramebuffers(1, &surface.source_fbo);
+    }
+    for (const GLuint texture : {surface.source, surface.destination}) {
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(target.width),
+                     static_cast<GLsizei>(target.height), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, surface.source_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, surface.source, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, surface.depth);
+    surface.source_ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
     return true;
 }
 
@@ -647,6 +787,13 @@ bool StartPass(Surface& surface, const TargetContents* contents, std::string* er
     glDepthMask(GL_TRUE);
     glClearDepthf(1.0f);
     glClear(GL_DEPTH_BUFFER_BIT);
+    if (surface.has_stencil) {
+        glDisable(GL_SCISSOR_TEST);
+        glStencilMask(0xFF);
+        glClearStencil(0);
+        glClear(GL_STENCIL_BUFFER_BIT);
+        glDisable(GL_STENCIL_TEST);
+    }
     surface.live = true;
     surface.used = ++g_.clock;
     g_.current = &surface;
@@ -870,9 +1017,19 @@ bool Begin(const Target& target, const TargetContents* contents, std::string* er
     return true;
 }
 
-void EndFrame() {
+void EndFrame(u32 address) {
+    bool found = false;
     for (auto& [key, surface] : g_.surfaces) {
-        surface.live = false;
+        if (surface.target.address == address) {
+            surface.live = false;
+            found = true;
+        }
+    }
+    if (!found) {
+        // (the game swapped a buffer nothing was drawn into: every pass is over as far as this frame goes)
+        for (auto& [key, surface] : g_.surfaces) {
+            surface.live = false;
+        }
     }
 }
 
@@ -953,11 +1110,67 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
     }
     SetFog(state.fragment);
 
+    Surface& surface = *g_.current;
+    const GLsizei w = static_cast<GLsizei>(surface.target.width);
+    const GLsizei h = static_cast<GLsizei>(surface.target.height);
+    const bool logic = state.logic_op != 3 && state.logic_op != 6;
+    const bool emulate = logic && surface.source_ok && surface.has_stencil && g_.composite.program != 0;
     glBindVertexArray(g_.vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_.vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(static_cast<std::size_t>(count) * kVertexStride), vertices,
                  GL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count));
+    if (emulate) {
+        // The draw goes into the source texture; the depth test writes the depth buffer the two framebuffers share, and
+        // the stencil marks the pixels that passed, so the composite leaves the others as they were.
+        glBindFramebuffer(GL_FRAMEBUFFER, surface.source_fbo);
+        glDisable(GL_SCISSOR_TEST);
+        glStencilMask(0xFF);
+        glClearStencil(0);
+        glClear(GL_STENCIL_BUFFER_BIT);
+        if (state.scissor_width != 0 && state.scissor_height != 0) {
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(state.scissor_x, state.scissor_y, static_cast<GLsizei>(state.scissor_width),
+                      static_cast<GLsizei>(state.scissor_height));
+        }
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_ALWAYS, 1, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count));
+        glDisable(GL_STENCIL_TEST);
+        // Then the composite: a copy of the target's pixels, the source, and the op, over the marked pixels only.
+        glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
+        glBindTexture(GL_TEXTURE_2D, surface.destination);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+        glViewport(0, 0, w, h);
+        glUseProgram(g_.composite.program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, surface.source);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, surface.destination);
+        glUniform1i(g_.composite.source, 0);
+        glUniform1i(g_.composite.destination, 1);
+        glUniform1i(g_.composite.op, static_cast<GLint>(state.logic_op));
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask((state.colour_write & 1) != 0, (state.colour_write & 2) != 0, (state.colour_write & 4) != 0,
+                    (state.colour_write & 8) != 0);
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 1, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glBindVertexArray(g_.composite.vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDisable(GL_STENCIL_TEST);
+        glActiveTexture(GL_TEXTURE0);
+    } else {
+        if (state.logic_op == 6) {
+            // NoOp writes no colour; the draw's depth write stays (as the Vulkan path's colour write mask of 0 keeps it).
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        }
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count));
+    }
     const GLenum error_gl = glGetError();
     if (error_gl != GL_NO_ERROR) {
         char why[96];
@@ -1043,10 +1256,17 @@ void Forget() {
     }
     g_.surfaces.clear();
     GLuint vao = g_.vao, vbo = g_.vbo, program = g_.program, fog_lut = g_.fog_lut;
+    GLuint composite_vao = g_.composite.vao, composite_program = g_.composite.program;
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &vbo);
     glDeleteTextures(1, &fog_lut);
     glDeleteProgram(program);
+    if (composite_vao != 0) {
+        glDeleteVertexArrays(1, &composite_vao);
+    }
+    if (composite_program != 0) {
+        glDeleteProgram(composite_program);
+    }
     g_ = Objects{};
 }
 
@@ -1069,7 +1289,7 @@ bool Begin(const Target&, const TargetContents*, std::string* error) {
     return false;
 }
 
-void EndFrame() {}
+void EndFrame(u32) {}
 
 bool DrawTriangles(const void*, u32, const DrawState&, std::string* error) {
     *error = kNoGles;

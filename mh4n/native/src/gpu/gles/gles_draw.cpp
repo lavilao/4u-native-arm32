@@ -30,6 +30,7 @@ constexpr u32 kRegFogModeAndMasks = 0xE0;  // fog mode 0-2, update mask rgb 8-11
 constexpr u32 kRegFogColour = 0xE1;       // r 0-7, g 8-15, b 16-23
 constexpr u32 kRegTevCombinerBuffer = 0xFD;
 constexpr u32 kRegOutputMerger = 0x100;  // fragment operation mode 0-1, alphablend enable 8
+constexpr u32 kRegLogicOp = 0x102;        // bits 0-3 (ignored while blending is on)
 constexpr u32 kRegBlendEquations = 0x101;
 constexpr u32 kRegBlendConst = 0x103;
 constexpr u32 kRegAlphaTest = 0x104;      // enable 0, function 4-6, reference 8-15
@@ -97,7 +98,11 @@ void MakeFixedFunction(const std::array<u32, pica::kNumRegs>& regs, bool flipped
     out->flipped = flipped;
 
     const u32 merger = regs[kRegOutputMerger];
-    out->blend = pica::BitsOf(merger, 8, 1) != 0;
+    const bool blending_enabled = pica::BitsOf(merger, 8, 1) != 0;
+    // The canonical rule (gpu/fragment/key.cpp): the logic op register is the op only while blending is off; blending on
+    // means the blender's result is what is written.
+    out->logic_op = blending_enabled ? 3u : pica::BitsOf(regs[kRegLogicOp], 0, 4);
+    out->blend = blending_enabled;
     if (out->blend) {
         const u32 word = regs[kRegBlendEquations];
         out->blend_equation_rgb = pica::BitsOf(word, 0, 3);

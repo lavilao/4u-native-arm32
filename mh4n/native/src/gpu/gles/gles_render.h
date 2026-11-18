@@ -4,8 +4,9 @@
 // The vertex stage passes the batch through (its positions are clip space already, gles_draw.h's recipe) and hands the
 // fragment stage the colour and the three texture coordinates. The fragment stage is the PICA's own: the six combiner
 // (TEV) stages, read from uniforms, over the primary colour, the three texture units, the previous stage's output, the
-// combiner buffer and the stages' constant colours; the alpha test; the fog, from the table the game filled. What is
-// not here yet: the procedural texture, the shadow stages, and the logic op (GLES has none: such a draw is copied).
+// combiner buffer and the stages' constant colours; the alpha test; the fog, from the table the game filled; and the
+// logic op (drawn into a source texture and composited, GLES having none). What is not here yet: the procedural texture
+// and the shadow stages.
 //
 // Android only: on another host every call returns false with the reason, so the PC runner and the tests build and run
 // (the GLES GPU does not exist there).
@@ -93,6 +94,9 @@ struct DrawState {
     u32 blend_source_rgb = 1, blend_dest_rgb = 0;
     u32 blend_source_alpha = 1, blend_dest_alpha = 0;
     float blend_constant[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // The logic op (register 0x102, only while blending is off): Azahar's LogicOp, 3 (Copy) when there is none. GLES has
+    // no logic op, so the others are drawn into a source texture and composited onto the target, bit by bit.
+    u32 logic_op = 3;
     u32 cull = 0;
     bool flipped = false;
 
@@ -124,8 +128,9 @@ bool Begin(const Target& target, const TargetContents* contents, std::string* er
 // Draws `count` vertices of the batch (triangle_batch.h's HardwareVertex layout, 88 bytes each) in triangles.
 bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std::string* error);
 
-// The frame is over (the game swapped its buffers): the next draw starts its pass, so the target is cleared for it.
-void EndFrame();
+// The screen's frame is over (the game swapped the colour buffer at `address`): that buffer's pass ends, so the next
+// draw into it starts from the picture guest memory holds then.
+void EndFrame(u32 address);
 
 // The colour target as RGBA8 (`out` = width * height * 4, row 0 first): the target whose colour buffer is `address`
 // (the buffer the game swapped), else the one of the last draw.
