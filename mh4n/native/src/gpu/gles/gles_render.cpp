@@ -91,6 +91,16 @@ uniform int u_fog_mode;
 uniform int u_fog_flip;
 uniform vec3 u_fog_colour;
 
+uniform sampler2D u_proctex;
+uniform int u_proctex_enable;
+uniform int u_proctex_config;
+uniform int u_proctex_lut;
+uniform int u_proctex_offset;
+uniform int u_proctex_coordinate;
+uniform vec2 u_proctex_amplitude;
+uniform vec2 u_proctex_phase;
+uniform vec2 u_proctex_frequency;
+
 out vec4 o_colour;
 
 // The PICA's eight bits of precision between stages (generator.cpp's byteround).
@@ -116,11 +126,11 @@ vec2 Coordinate(int which, vec2 c0, vec2 c1, vec2 c2) {
 }
 
 // TevStageConfig::Source: PrimaryColor 0, PrimaryFragmentColor 1, SecondaryFragmentColor 2, Texture0-2 3-5,
-// Texture3 6 (the procedural texture: not here), PreviousBuffer 0xD, Constant 0xE, Previous 0xF. The primary fragment
+// Texture3 6 (the procedural texture), PreviousBuffer 0xD, Constant 0xE, Previous 0xF. The primary fragment
 // colour is the lighting result, which this renderer does not shade: the vertex colour stands in for it, and the
 // secondary colour is nothing.
 vec4 TevSource(int source, vec4 primary, vec4 previous, vec4 held, vec4 constant_colour,
-               vec4 texture0, vec4 texture1, vec4 texture2) {
+               vec4 texture0, vec4 texture1, vec4 texture2, vec4 texture3) {
     if (source == 1) {
         return primary;
     }
@@ -135,6 +145,9 @@ vec4 TevSource(int source, vec4 primary, vec4 previous, vec4 held, vec4 constant
     }
     if (source == 5) {
         return texture2;
+    }
+    if (source == 6) {
+        return texture3;
     }
     if (source == 0xD) {
         return held;
@@ -305,6 +318,179 @@ bool AlphaTestFails(int function, int alpha) {
     return alpha < u_alpha_ref;
 }
 
+// ---- the procedural texture (lavilao/pocket-native's proctex.rs, in GLSL) -----------------------------------------
+
+// The noise table has 16 rows and 16 mixes (their random()'s two constant tables).
+uint ProcTexRows(uint i) {
+    if (i == 0u) return 0u;
+    if (i == 1u) return 4u;
+    if (i == 2u) return 10u;
+    if (i == 3u) return 8u;
+    if (i == 4u) return 4u;
+    if (i == 5u) return 9u;
+    if (i == 6u) return 7u;
+    if (i == 7u) return 12u;
+    if (i == 8u) return 5u;
+    if (i == 9u) return 15u;
+    if (i == 10u) return 13u;
+    if (i == 11u) return 14u;
+    if (i == 12u) return 11u;
+    if (i == 13u) return 15u;
+    if (i == 14u) return 2u;
+    return 11u;
+}
+uint ProcTexMix(uint i) {
+    if (i == 0u) return 10u;
+    if (i == 1u) return 2u;
+    if (i == 2u) return 15u;
+    if (i == 3u) return 8u;
+    if (i == 4u) return 0u;
+    if (i == 5u) return 7u;
+    if (i == 6u) return 4u;
+    if (i == 7u) return 5u;
+    if (i == 8u) return 5u;
+    if (i == 9u) return 13u;
+    if (i == 10u) return 2u;
+    if (i == 11u) return 6u;
+    if (i == 12u) return 13u;
+    if (i == 13u) return 9u;
+    if (i == 14u) return 3u;
+    return 14u;
+}
+
+// Row `map` (0 noise, 1 colour map, 2 alpha map) at a coordinate from 0 to 1, between its entries (value, step).
+float ProcTexLookup(int map, float coordinate) {
+    float at = coordinate * 128.0;
+    int entry = clamp(int(at), 0, 127);
+    vec2 value = texelFetch(u_proctex, ivec2(entry, map), 0).rg;
+    return value.r + (at - float(entry)) * value.g;
+}
+
+// A pseudo-random value from -1 to 1 for a point of the noise's grid.
+float ProcTexRandom(int x, int y) {
+    uint u = x < 0 ? 0u : uint(x);
+    uint v = y < 0 ? 0u : uint(y);
+    uint one_u = ((((u % 9u) + 2u) * 3u) & 0xFu) ^ ProcTexRows((u / 9u) & 0xFu);
+    uint one_v = ((((v % 9u) + 2u) * 3u) & 0xFu) ^ ProcTexRows((v / 9u) & 0xFu);
+    if ((one_u & 3u) == 1u) {
+        one_v += 4u;
+    }
+    one_v ^= (one_u & 1u) * 6u;
+    one_v += 10u + one_u;
+    one_v &= 0xFu;
+    one_v ^= ProcTexMix(one_u & 0xFu);
+    return -1.0 + float(one_v) * 2.0 / 15.0;
+}
+
+// How far the shift moves one coordinate, by the other.
+float ProcTexShift(float other, int mode, int edge) {
+    float amount = edge == 3 ? 1.0 : 0.5;
+    int whole = int(other);
+    if (mode == 1) {
+        return amount * float((whole / 2) % 2);
+    }
+    if (mode == 2) {
+        return amount * float(((whole + 1) / 2) % 2);
+    }
+    return 0.0;
+}
+
+// Brings a coordinate back to 0 to 1: to zero, to the edge, repeat, mirrored repeat, pulse.
+float ProcTexWrap(float c, int mode) {
+    if (mode == 0) {
+        return c > 1.0 ? 0.0 : c;
+    }
+    if (mode == 1) {
+        return min(c, 1.0);
+    }
+    if (mode == 2) {
+        return c - floor(c);
+    }
+    if (mode == 3) {
+        int whole = int(c);
+        float part = c - float(whole);
+        return whole % 2 == 0 ? part : 1.0 - part;
+    }
+    if (mode == 4) {
+        return c <= 0.5 ? 0.0 : 1.0;
+    }
+    return clamp(c, 0.0, 1.0);
+}
+
+// The two coordinates made into one (ProcTexCombiner).
+float ProcTexCombine(float u, float v, int function) {
+    float len = sqrt(u * u + v * v);
+    if (function == 0) return u;
+    if (function == 1) return u * u;
+    if (function == 2) return v;
+    if (function == 3) return v * v;
+    if (function == 4) return (u + v) * 0.5;
+    if (function == 5) return (u * u + v * v) * 0.5;
+    if (function == 6) return min(len, 1.0);
+    if (function == 7) return min(u, v);
+    if (function == 8) return max(u, v);
+    if (function == 9) return min(((u + v) * 0.5 + len) * 0.5, 1.0);
+    return 0.0;
+}
+
+// The value the noise moves a pair of coordinates by, -1 to 1.
+float ProcTexNoise(float u, float v) {
+    float x = 9.0 * u_proctex_frequency.x * abs(u + u_proctex_phase.x);
+    float y = 9.0 * u_proctex_frequency.y * abs(v + u_proctex_phase.y);
+    int xi = int(x);
+    int yi = int(y);
+    float xf = x - float(xi);
+    float yf = y - float(yi);
+    float g0 = ProcTexRandom(xi, yi) * (xf + yf);
+    float g1 = ProcTexRandom(xi + 1, yi) * (xf + yf - 1.0);
+    float g2 = ProcTexRandom(xi, yi + 1) * (xf + yf - 1.0);
+    float g3 = ProcTexRandom(xi + 1, yi + 1) * (xf + yf - 2.0);
+    float s = ProcTexLookup(0, xf);
+    float t = ProcTexLookup(0, yf);
+    float bottom = g0 * (1.0 - s) + g1 * s;
+    float top = g2 * (1.0 - s) + g3 * s;
+    return bottom * (1.0 - t) + top * t;
+}
+
+// The procedural texture at a pair of coordinates, RGBA 0 to 1.
+vec4 ProcTexSample(vec2 coordinate) {
+    int config = u_proctex_config;
+    int edge_u = config & 7;
+    int edge_v = (config >> 3) & 7;
+    float u = abs(coordinate.x);
+    float v = abs(coordinate.y);
+    // The shifts come from the coordinates before the noise moves them.
+    float shift_u = ProcTexShift(v, (config >> 16) & 3, edge_u);
+    float shift_v = ProcTexShift(u, (config >> 18) & 3, edge_v);
+    if ((config & (1 << 15)) != 0) {
+        float noise = ProcTexNoise(u, v);
+        u = abs(u + noise * u_proctex_amplitude.x);
+        v = abs(v + noise * u_proctex_amplitude.y);
+    }
+    u = ProcTexWrap(u + shift_u, edge_u);
+    v = ProcTexWrap(v + shift_v, edge_v);
+
+    float coordinate_in_table = ProcTexLookup(1, ProcTexCombine(u, v, (config >> 6) & 0xF));
+    float width = float((u_proctex_lut >> 11) & 0xFF);
+    float position = float(u_proctex_offset & 0xFF) + coordinate_in_table * max(width - 1.0, 0.0);
+    int entry = clamp(int(position), 0, 255);
+    int lut_filter = u_proctex_lut & 7;
+    vec4 color;
+    if (lut_filter == 1 || lut_filter == 3 || lut_filter == 5) {
+        // linear (and the two linear mipmap filters): the step to the next entry is the colour table's pair
+        color = (texelFetch(u_proctex, ivec2(entry, 3), 0) +
+                 (position - float(entry)) * texelFetch(u_proctex, ivec2(entry, 4), 0)) / 255.0;
+    } else {
+        color = texelFetch(u_proctex, ivec2(clamp(int(position + 0.5), 0, 255), 3), 0) / 255.0;
+    }
+    color = clamp(color, vec4(0.0), vec4(1.0));
+    // An alpha of its own skips the colour table: the alpha map gives it.
+    if ((config & (1 << 14)) != 0) {
+        color.a = clamp(ProcTexLookup(2, ProcTexCombine(u, v, (config >> 10) & 0xF)), 0.0, 1.0);
+    }
+    return color;
+}
+
 void main() {
     // The PICA's scissor mode Exclude: the pixels inside the register rectangle are not drawn (Include is the scissor
     // rectangle the GL state carries).
@@ -319,6 +505,7 @@ void main() {
     vec4 texture0 = u_has_texture0 != 0 ? texture(u_texture0, Coordinate(u_coordinate0, v_texcoord0, v_texcoord1, v_texcoord2)) : vec4(0.0);
     vec4 texture1 = u_has_texture1 != 0 ? texture(u_texture1, Coordinate(u_coordinate1, v_texcoord0, v_texcoord1, v_texcoord2)) : vec4(0.0);
     vec4 texture2 = u_has_texture2 != 0 ? texture(u_texture2, Coordinate(u_coordinate2, v_texcoord0, v_texcoord1, v_texcoord2)) : vec4(0.0);
+    vec4 texture3 = u_proctex_enable != 0 ? ProcTexSample(Coordinate(u_proctex_coordinate, v_texcoord0, v_texcoord1, v_texcoord2)) : vec4(0.0);
 
     vec4 previous = vec4(0.0);            // combiner_output
     vec4 held = vec4(0.0);                // combiner_buffer
@@ -349,7 +536,7 @@ void main() {
         vec3 colors[3];
         for (int i = 0; i < 3; ++i) {
             colors[i] = ColorModifier(TevSource(source[i], primary, previous, held, constant_colour,
-                                                texture0, texture1, texture2),
+                                                texture0, texture1, texture2, texture3),
                                       modifier[i]);
         }
         int color_op = ops & 0xF;
@@ -378,7 +565,7 @@ void main() {
             float alphas[3];
             for (int i = 0; i < 3; ++i) {
                 alphas[i] = AlphaModifier(TevSource(alpha_source[i], primary, previous, held, constant_colour,
-                                                    texture0, texture1, texture2),
+                                                    texture0, texture1, texture2, texture3),
                                           alpha_modifier[i]);
             }
             alpha_output = byteround(AlphaCombiner(alpha_op, alphas[0], alphas[1], alphas[2]));
@@ -491,6 +678,8 @@ struct Uniforms {
     GLint flip_y = -1;
     GLint texture[3] = {-1, -1, -1}, has_texture[3] = {-1, -1, -1}, coordinate[3] = {-1, -1, -1};
     GLint fog_lut = -1, fog_mode = -1, fog_flip = -1, fog_colour = -1;
+    GLint proctex = -1, proctex_enable = -1, proctex_config = -1, proctex_lut = -1, proctex_offset = -1,
+          proctex_coordinate = -1, proctex_amplitude = -1, proctex_phase = -1, proctex_frequency = -1;
 };
 
 // One colour buffer's target: a framebuffer with the colour as a texture (so it can be read back) and a depth
@@ -521,6 +710,8 @@ struct Objects {
     GLuint vbo = 0;
     GLuint fog_lut = 0;  // the game's fog table, as a 128x1 RG32F texture (made on first use)
     u32 fog_lut_key = 0;
+    GLuint proctex = 0;  // the procedural texture's tables, as a 256x5 RGBA32F texture
+    u32 proctex_key = 0;
     Surface* current = nullptr;  // the target of the last Begin
     u64 clock = 0;
     Uniforms uniforms;
@@ -609,6 +800,15 @@ bool Build(std::string* error) {
     u.fog_mode = glGetUniformLocation(program, "u_fog_mode");
     u.fog_flip = glGetUniformLocation(program, "u_fog_flip");
     u.fog_colour = glGetUniformLocation(program, "u_fog_colour");
+    u.proctex = glGetUniformLocation(program, "u_proctex");
+    u.proctex_enable = glGetUniformLocation(program, "u_proctex_enable");
+    u.proctex_config = glGetUniformLocation(program, "u_proctex_config");
+    u.proctex_lut = glGetUniformLocation(program, "u_proctex_lut");
+    u.proctex_offset = glGetUniformLocation(program, "u_proctex_offset");
+    u.proctex_coordinate = glGetUniformLocation(program, "u_proctex_coordinate");
+    u.proctex_amplitude = glGetUniformLocation(program, "u_proctex_amplitude");
+    u.proctex_phase = glGetUniformLocation(program, "u_proctex_phase");
+    u.proctex_frequency = glGetUniformLocation(program, "u_proctex_frequency");
     for (int unit = 0; unit < 3; ++unit) {
         const std::string texture = "u_texture" + std::to_string(unit);
         const std::string has = "u_has_texture" + std::to_string(unit);
@@ -1008,6 +1208,91 @@ void SetFog(const FragmentState& fragment) {
     glActiveTexture(GL_TEXTURE0);
 }
 
+// The procedural texture's five tables as one key (a changed entry gives a new one, so they upload once).
+u32 ProcTexKey(const ProcTexState& proctex) {
+    u32 hash = 2166136261u;
+    const auto mix = [&hash](const std::array<u32, 128>& table) {
+        for (const u32 word : table) {
+            hash = (hash ^ word) * 16777619u;
+        }
+    };
+    const auto mix_colours = [&hash](const std::array<u32, 256>& table) {
+        for (const u32 word : table) {
+            hash = (hash ^ word) * 16777619u;
+        }
+    };
+    mix(*proctex.noise_map);
+    mix(*proctex.color_map);
+    mix(*proctex.alpha_map);
+    mix_colours(*proctex.color_table);
+    mix_colours(*proctex.color_diff_table);
+    return hash != 0 ? hash : 1;
+}
+
+// The procedural texture (texture unit 3): its registers as uniforms, its tables as a 256x5 RGBA32F texture on unit 4
+// (row 0 noise, 1 colour map, 2 alpha map, 3 the colours, 4 the steps), uploaded when an entry changed. The decoding is
+// lavilao/pocket-native's proctex.rs.
+void SetProcTex(const ProcTexState& proctex) {
+    const Uniforms& u = g_.uniforms;
+    const bool enable = proctex.enable && proctex.noise_map != nullptr && proctex.color_map != nullptr &&
+                        proctex.alpha_map != nullptr && proctex.color_table != nullptr && proctex.color_diff_table != nullptr;
+    glUniform1i(u.proctex_enable, enable ? 1 : 0);
+    if (!enable) {
+        return;
+    }
+    glUniform1i(u.proctex_config, static_cast<GLint>(proctex.config));
+    glUniform1i(u.proctex_lut, static_cast<GLint>(proctex.lut));
+    glUniform1i(u.proctex_offset, static_cast<GLint>(proctex.offset));
+    glUniform1i(u.proctex_coordinate, static_cast<GLint>(std::min(proctex.coordinate, 2u)));
+    glUniform2f(u.proctex_amplitude, static_cast<GLfloat>(static_cast<s16>(proctex.noise[0] & 0xFFFFu)) / 4095.0f,
+                static_cast<GLfloat>(static_cast<s16>(proctex.noise[1] & 0xFFFFu)) / 4095.0f);
+    glUniform2f(u.proctex_phase, static_cast<GLfloat>(proctex.noise[0] >> 16) / 4096.0f,
+                static_cast<GLfloat>(proctex.noise[1] >> 16) / 4096.0f);
+    glUniform2f(u.proctex_frequency, HalfToFloat(proctex.frequency & 0xFFFFu), HalfToFloat(proctex.frequency >> 16));
+    const u32 key = ProcTexKey(proctex);
+    if (g_.proctex == 0) {
+        glGenTextures(1, &g_.proctex);
+        glBindTexture(GL_TEXTURE_2D, g_.proctex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    if (key != g_.proctex_key) {
+        float values[256 * 5 * 4] = {};
+        const auto maps = [&values](u32 row, const std::array<u32, 128>& table) {
+            for (u32 i = 0; i < 128; ++i) {
+                const u32 word = table[i];
+                const s32 step = static_cast<s32>(word << 12) >> 20;  // a signed 12-bit step
+                values[(row * 256 + i) * 4 + 0] = static_cast<float>(word & 0xFFFu) / 4095.0f;
+                values[(row * 256 + i) * 4 + 1] = static_cast<float>(step) / 4095.0f;
+            }
+        };
+        maps(0, *proctex.noise_map);
+        maps(1, *proctex.color_map);
+        maps(2, *proctex.alpha_map);
+        for (u32 i = 0; i < 256; ++i) {
+            const u32 word = (*proctex.color_table)[i];
+            const u32 difference = (*proctex.color_diff_table)[i];
+            for (u32 channel = 0; channel < 4; ++channel) {
+                values[(3 * 256 + i) * 4 + channel] = static_cast<float>((word >> (8 * channel)) & 0xFFu);
+                // The steps come halved, signed bytes (a step of -128 is -256).
+                values[(4 * 256 + i) * 4 + channel] =
+                    static_cast<float>(static_cast<s8>((difference >> (8 * channel)) & 0xFFu)) * 2.0f;
+            }
+        }
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, g_.proctex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 256, 5, 0, GL_RGBA, GL_FLOAT, values);
+        g_.proctex_key = key;
+    }
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, g_.proctex);
+    glUniform1i(u.proctex, 4);
+    glActiveTexture(GL_TEXTURE0);
+}
+
 void SetCull(const DrawState& state) {
     if (state.cull == 0) {
         glDisable(GL_CULL_FACE);
@@ -1154,6 +1439,7 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
         glUniform1i(u.coordinate[unit], static_cast<GLint>(set ? std::min(state.textures[unit].coordinate, 2u) : 0u));
     }
     SetFog(state.fragment);
+    SetProcTex(state.fragment.proctex);
 
     Surface& surface = *g_.current;
     const GLsizei w = static_cast<GLsizei>(surface.target.width);
@@ -1300,11 +1586,14 @@ void Forget() {
         DeleteSurface(surface);
     }
     g_.surfaces.clear();
-    GLuint vao = g_.vao, vbo = g_.vbo, program = g_.program, fog_lut = g_.fog_lut;
+    GLuint vao = g_.vao, vbo = g_.vbo, program = g_.program, fog_lut = g_.fog_lut, proctex = g_.proctex;
     GLuint composite_vao = g_.composite.vao, composite_program = g_.composite.program;
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &vbo);
     glDeleteTextures(1, &fog_lut);
+    if (proctex != 0) {
+        glDeleteTextures(1, &proctex);
+    }
     glDeleteProgram(program);
     if (composite_vao != 0) {
         glDeleteVertexArrays(1, &composite_vao);

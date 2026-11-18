@@ -29,6 +29,12 @@ constexpr u32 kRegTevStage[6] = {0xC0, 0xC8, 0xD0, 0xD8, 0xF0, 0xF8};
 constexpr u32 kTevSources = 0, kTevModifiers = 1, kTevOps = 2, kTevConstColour = 3, kTevScales = 4;
 constexpr u32 kRegFogModeAndMasks = 0xE0;  // fog mode 0-2, update mask rgb 8-11, update mask alpha 12-15, fog flip 16
 constexpr u32 kRegFogColour = 0xE1;       // r 0-7, g 8-15, b 16-23
+constexpr u32 kRegProcTex = 0xA8;         // the procedural texture's config (clamps, combiners, noise, shifts)
+constexpr u32 kRegProcTexNoiseU = 0xA9;   // amplitude 0-15 (s16, fixed 1.3.12), phase 16-31
+constexpr u32 kRegProcTexNoiseV = 0xAA;
+constexpr u32 kRegProcTexFrequency = 0xAB;  // halves, u 0-15 and v 16-31
+constexpr u32 kRegProcTexLut = 0xAC;        // filter 0-2, lod 3-10, width 11-18
+constexpr u32 kRegProcTexLutOffset = 0xAD;  // a byte a level
 constexpr u32 kRegTevCombinerBuffer = 0xFD;
 constexpr u32 kRegOutputMerger = 0x100;  // fragment operation mode 0-1, alphablend enable 8
 constexpr u32 kRegLogicOp = 0x102;        // bits 0-3 (ignored while blending is on)
@@ -363,6 +369,23 @@ void Drawer::Draw(const pica::DrawCall& draw) {
     // (the table is the state's, not a register's: the game writes it through the LUT data port)
     draw_state.fragment.fog_lut = state.fog.lut.data();
     draw_state.fragment.fog_lut_key = FogLutKey(state.fog.lut);
+    // The procedural texture (texture unit 3), when the main config turns it on.
+    render::ProcTexState& proctex = draw_state.fragment.proctex;
+    proctex.enable = pica::BitsOf(regs[kRegMainConfig], 10, 1) != 0;
+    if (proctex.enable) {
+        proctex.config = regs[kRegProcTex];
+        proctex.noise[0] = regs[kRegProcTexNoiseU];
+        proctex.noise[1] = regs[kRegProcTexNoiseV];
+        proctex.frequency = regs[kRegProcTexFrequency];
+        proctex.lut = regs[kRegProcTexLut];
+        proctex.offset = regs[kRegProcTexLutOffset];
+        proctex.coordinate = std::min(pica::BitsOf(regs[kRegMainConfig], 8, 2), 2u);
+        proctex.noise_map = &state.proctex.noise_table;
+        proctex.color_map = &state.proctex.color_map_table;
+        proctex.alpha_map = &state.proctex.alpha_map_table;
+        proctex.color_table = &state.proctex.color_table;
+        proctex.color_diff_table = &state.proctex.color_diff_table;
+    }
 
     // The draw's textures, unit by unit, decoded by the texture cache: each image is uploaded once per generation.
     texture::TexturesOfDraw(regs.data(), texture_refs_, nullptr);

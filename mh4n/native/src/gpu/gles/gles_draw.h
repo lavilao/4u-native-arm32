@@ -10,9 +10,9 @@
 //      registers the three units and the six combiner stages, the fragment registers the alpha test, and the framebuffer
 //      registers the output merger (depth test and its function and write, the colour write mask, blending, culling);
 //      then the rasterizer draws them.
-// The PICA's fog (mode 5) is applied after the combiner, from the table the game filled; lighting is the vertex unit's
-// (the PICA shades per vertex in its vertex shader, so the primary colour is the lit vertex colour). What is not here
-// yet: the procedural texture, the shadow stages, and the logic op (GLES has none: such a draw is copied).
+// The PICA's fog (mode 5) is applied after the combiner, from the table the game filled; the procedural texture comes
+// from its own tables; lighting is the vertex unit's (the PICA shades per vertex in its vertex shader, so the primary
+// colour is the lit vertex colour). What is not here yet: the shadow stages and cube maps.
 //
 // Thread: the GPU's, as the command processor's (principle 6).
 #pragma once

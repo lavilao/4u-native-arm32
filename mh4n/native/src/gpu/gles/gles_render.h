@@ -5,13 +5,15 @@
 // fragment stage the colour and the three texture coordinates. The fragment stage is the PICA's own: the six combiner
 // (TEV) stages, read from uniforms, over the primary colour, the three texture units, the previous stage's output, the
 // combiner buffer and the stages' constant colours; the alpha test; the fog, from the table the game filled; and the
-// logic op (drawn into a source texture and composited, GLES having none). What is not here yet: the procedural texture
-// and the shadow stages.
+// logic op (drawn into a source texture and composited, GLES having none) and the procedural texture, whose tables the
+// game wrote (decoded into one float texture, as lavilao/pocket-native's proctex.rs does). What is not here yet: the
+// shadow stages (the shadow map is not drawn, so a shadow texture reads white) and cube maps.
 //
 // Android only: on another host every call returns false with the reason, so the PC runner and the tests build and run
 // (the GLES GPU does not exist there).
 #pragma once
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -57,6 +59,23 @@ struct CombinerStage {
     u32 constant = 0;
 };
 
+// The procedural texture (the PICA's texture unit 3), as registers 0xA8-0xAD and the five tables the game wrote (their
+// raw words: the renderer decodes them into one float texture, as lavilao/pocket-native's proctex.rs does).
+struct ProcTexState {
+    bool enable = false;
+    u32 config = 0;
+    u32 noise[2] = {0, 0};
+    u32 frequency = 0;
+    u32 lut = 0;
+    u32 offset = 0;
+    u32 coordinate = 0;  // which of the batch's coordinates it reads (main config bits 8-9)
+    const std::array<u32, 128>* noise_map = nullptr;
+    const std::array<u32, 128>* color_map = nullptr;
+    const std::array<u32, 128>* alpha_map = nullptr;
+    const std::array<u32, 256>* color_table = nullptr;
+    const std::array<u32, 256>* color_diff_table = nullptr;
+};
+
 // The fragment half of one draw: the combiner and the alpha test. Unset, the stages pass the primary colour through,
 // which is what a draw with no texture looks like.
 struct FragmentState {
@@ -80,6 +99,8 @@ struct FragmentState {
     float fog_colour[3] = {0.0f, 0.0f, 0.0f};
     const u32* fog_lut = nullptr;
     u32 fog_lut_key = 0;  // changes when the table's entries did; 0 means "not uploaded"
+
+    ProcTexState proctex;
 };
 
 // What one draw sets before it: the viewport and scissor rectangles the registers name (in the target's pixels, row 0
