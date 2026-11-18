@@ -3,17 +3,16 @@
 //
 // Per draw, as triangle_batch.h's recipe says:
 //   1. the primitive assembler applies the draw's register side effects;
-//   2. a draw Azahar would accelerate is not drawn here yet (it needs the vertex stage the Vulkan path translates), so
-//      it is noted and skipped, and so is a draw in the shadow mode (it renders into no attachment);
+//   2. a draw in the shadow mode (it renders into the shadow map) or of the fog's density pass is skipped: neither has a
+//      colour; a draw Azahar accelerates is shaded by the CPU vertex unit as any other, so the geometry is all drawn;
 //   3. the CPU runner shades it, the assembler builds its triangles, the batch fixes the quaternions up;
 //   4. the framebuffer registers give the target (size and colour buffer), the viewport and the scissor; the texturing
 //      registers the three units and the six combiner stages, the fragment registers the alpha test, and the framebuffer
 //      registers the output merger (depth test and its function and write, the colour write mask, blending, culling);
 //      then the rasterizer draws them.
-// What is not here yet: the fog, the lighting (a draw's primary colour is its vertex colour), the procedural texture,
-// the shadow stages, the logic op (GLES has none: a draw that asks for one is copied), and the accelerated draws. The
-// picture is therefore the game's geometry with the PICA's own combine of its colours and textures, which is what the
-// game's 2D screens are made of.
+// The PICA's fog (mode 5) is applied after the combiner, from the table the game filled; lighting is the vertex unit's
+// (the PICA shades per vertex in its vertex shader, so the primary colour is the lit vertex colour). What is not here
+// yet: the procedural texture, the shadow stages, and the logic op (GLES has none: such a draw is copied).
 //
 // Thread: the GPU's, as the command processor's (principle 6).
 #pragma once
@@ -35,8 +34,9 @@ namespace mh4n::gpu::gles {
 struct DrawStats {
     u64 draws = 0;              // draws the PICA issued
     u64 cpu_draws = 0;          // of them, shaded on the CPU and put through the rasterizer
-    u64 accelerated = 0;        // of them, ones Azahar accelerates: not drawn here yet
+    u64 accelerated = 0;        // of them, ones Azahar accelerates (the CPU vertex unit shades them here)
     u64 shadow = 0;             // of them, ones in the shadow mode (no attachment): not drawn here
+    u64 gas = 0;                // of them, ones of the fog's density pass (no colour): not drawn here
     u64 dropped = 0;            // of them, ones the CPU runner could not run
     u64 failed = 0;             // of them, ones the rasterizer refused
     u64 triangles = 0;          // triangles drawn
@@ -84,6 +84,7 @@ private:
     std::vector<texture::TextureRef> texture_refs_;
     render::Target target_;
     std::vector<u8> picture_;  // the last read back picture (RGBA8)
+    std::vector<u8> seed_;     // the colour buffer as guest memory holds it, for a pass's first draw (RGBA8)
     DrawStats stats_;
     bool told_failure_ = false;
 };

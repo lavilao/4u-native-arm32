@@ -4,9 +4,8 @@
 // The vertex stage passes the batch through (its positions are clip space already, gles_draw.h's recipe) and hands the
 // fragment stage the colour and the three texture coordinates. The fragment stage is the PICA's own: the six combiner
 // (TEV) stages, read from uniforms, over the primary colour, the three texture units, the previous stage's output, the
-// combiner buffer and the stages' constant colours; then the alpha test. What is not here yet: the fog, the lighting
-// that would give the fragment stages their colours (a draw's primary colour is its vertex colour), the procedural
-// texture, the shadow stages, and the logic op (GLES has none: such a draw is copied).
+// combiner buffer and the stages' constant colours; the alpha test; the fog, from the table the game filled. What is
+// not here yet: the procedural texture, the shadow stages, and the logic op (GLES has none: such a draw is copied).
 //
 // Android only: on another host every call returns false with the reason, so the PC runner and the tests build and run
 // (the GLES GPU does not exist there).
@@ -64,6 +63,15 @@ struct FragmentState {
     bool alpha_test = false;
     u32 alpha_func = 1;  // PICA CompareFunc (1 = Always)
     u32 alpha_ref = 0;
+
+    // The fog (registers 0xE0 and 0xE1): the mode the register names (5 = Fog), which way its depth runs (bit 16), the
+    // colour, and the 128-entry look-up table the game filled (two half-precision words an entry, r then g: the factor is
+    // r + g * fraction, as the fog code of gpu/fragment/fog/fog.cpp reads it). A null table leaves the fog off.
+    u32 fog_mode = 0;
+    bool fog_flip = false;
+    float fog_colour[3] = {0.0f, 0.0f, 0.0f};
+    const u32* fog_lut = nullptr;
+    u32 fog_lut_key = 0;  // changes when the table's entries did; 0 means "not uploaded"
 };
 
 // What one draw sets before it: the viewport and scissor rectangles the registers name (in the target's pixels, row 0
@@ -95,10 +103,23 @@ struct DrawState {
     FragmentState fragment;
 };
 
-// Makes the renderer's objects, or makes the colour target (and clears it): the picture of a pass starts empty, as the
-// game's first draw of it expects (it fills it). False, with `error`, on a host without GLES and on a driver that
-// refused the program or the target; the reason is logged once.
-bool Begin(const Target& target, std::string* error);
+// The target's existing picture, as RGBA8 (width * height * 4, row 0 first): the guest memory the framebuffer names. A
+// pass starts from it, as a GPU's framebuffer load does, so the game's memory fills and what was drawn into the buffer
+// before its swap survive the pass. Null means an empty target (cleared to opaque black).
+struct TargetContents {
+    const u8* rgba8 = nullptr;
+    u32 width = 0;
+    u32 height = 0;
+};
+
+// True while the target's pass is going on (a draw into it already started it this frame): its picture is loaded and its
+// depth cleared once, at the first draw, not at every draw.
+bool IsPassStarted(const Target& target);
+
+// Makes the renderer's objects, or makes (and starts) the colour target's pass: its existing picture is loaded from
+// `contents`, and its depth is cleared. False, with `error`, on a host without GLES and on a driver that refused the
+// program or the target; the reason is logged once.
+bool Begin(const Target& target, const TargetContents* contents, std::string* error);
 
 // Draws `count` vertices of the batch (triangle_batch.h's HardwareVertex layout, 88 bytes each) in triangles.
 bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std::string* error);
@@ -106,8 +127,9 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
 // The frame is over (the game swapped its buffers): the next draw starts its pass, so the target is cleared for it.
 void EndFrame();
 
-// The colour target as RGBA8 (`out` = width * height * 4, row 0 first).
-bool ReadTarget(std::vector<u8>& out, u32* width, u32* height, std::string* error);
+// The colour target as RGBA8 (`out` = width * height * 4, row 0 first): the target whose colour buffer is `address`
+// (the buffer the game swapped), else the one of the last draw.
+bool ReadTarget(u32 address, std::vector<u8>& out, u32* width, u32* height, std::string* error);
 
 // One line for log.txt: the renderer's objects and the last target.
 std::string Describe();

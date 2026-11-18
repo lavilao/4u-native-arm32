@@ -26,7 +26,8 @@ constexpr u32 kRegTextureUnit[3] = {0x81, 0x91, 0x99};  // a unit: border colour
 constexpr u32 kTextureParams = 2;                        // wrap t 8-10, wrap s 12-14
 constexpr u32 kRegTevStage[6] = {0xC0, 0xC8, 0xD0, 0xD8, 0xF0, 0xF8};
 constexpr u32 kTevSources = 0, kTevModifiers = 1, kTevOps = 2, kTevConstColour = 3, kTevScales = 4;
-constexpr u32 kRegFogModeAndMasks = 0xE0;  // fog mode 0-2, update mask rgb 8-11, update mask alpha 12-15
+constexpr u32 kRegFogModeAndMasks = 0xE0;  // fog mode 0-2, update mask rgb 8-11, update mask alpha 12-15, fog flip 16
+constexpr u32 kRegFogColour = 0xE1;       // r 0-7, g 8-15, b 16-23
 constexpr u32 kRegTevCombinerBuffer = 0xFD;
 constexpr u32 kRegOutputMerger = 0x100;  // fragment operation mode 0-1, alphablend enable 8
 constexpr u32 kRegBlendEquations = 0x101;
@@ -39,7 +40,8 @@ constexpr u32 kRegColourFormat = 0x117;
 constexpr u32 kRegColourAddress = 0x11D;  // bits 0-27, in units of 8 bytes
 constexpr u32 kRegFramebufferSize = 0x11E;
 
-constexpr u32 kShadowMode = 3;  // FragmentOperationMode::Shadow
+constexpr u32 kGasDensityMode = 1;  // FragmentOperationMode::Gas (the fog's density pass: no colour)
+constexpr u32 kShadowMode = 3;      // FragmentOperationMode::Shadow (into the shadow map: no colour)
 
 // Azahar's Common::Rectangle: top >= bottom (y up).
 struct Rect4 {
@@ -209,22 +211,93 @@ void EncodeColourRow(const u8* rgba8, u32 width, u32 format, u8* out) {
     }
 }
 
+void DecodeColourRow(const u8* src, u32 width, u32 format, u8* rgba8) {
+    switch (format & 7) {
+    case 1:  // RGB8
+        for (u32 x = 0; x < width; ++x) {
+            rgba8[x * 4 + 0] = src[x * 3 + 0];
+            rgba8[x * 4 + 1] = src[x * 3 + 1];
+            rgba8[x * 4 + 2] = src[x * 3 + 2];
+            rgba8[x * 4 + 3] = 255;
+        }
+        return;
+    case 2:  // RGB5A1: rrrrrgggggbbbbba
+        for (u32 x = 0; x < width; ++x) {
+            u16 value = 0;
+            std::memcpy(&value, src + x * 2, 2);
+            const u16 r = static_cast<u16>((value >> 11) & 0x1F);
+            const u16 g = static_cast<u16>((value >> 6) & 0x1F);
+            const u16 b = static_cast<u16>((value >> 1) & 0x1F);
+            rgba8[x * 4 + 0] = static_cast<u8>((r * 255u + 15u) / 31u);
+            rgba8[x * 4 + 1] = static_cast<u8>((g * 255u + 15u) / 31u);
+            rgba8[x * 4 + 2] = static_cast<u8>((b * 255u + 15u) / 31u);
+            rgba8[x * 4 + 3] = (value & 1) != 0 ? 255 : 0;
+        }
+        return;
+    case 3:  // RGB565: rrrrrggggggbbbbb
+        for (u32 x = 0; x < width; ++x) {
+            u16 value = 0;
+            std::memcpy(&value, src + x * 2, 2);
+            const u16 r = static_cast<u16>((value >> 11) & 0x1F);
+            const u16 g = static_cast<u16>((value >> 5) & 0x3F);
+            const u16 b = static_cast<u16>(value & 0x1F);
+            rgba8[x * 4 + 0] = static_cast<u8>((r * 255u + 15u) / 31u);
+            rgba8[x * 4 + 1] = static_cast<u8>((g * 255u + 31u) / 63u);
+            rgba8[x * 4 + 2] = static_cast<u8>((b * 255u + 15u) / 31u);
+            rgba8[x * 4 + 3] = 255;
+        }
+        return;
+    case 4:  // RGBA4: rrrrggggbbbbaaaa
+        for (u32 x = 0; x < width; ++x) {
+            u16 value = 0;
+            std::memcpy(&value, src + x * 2, 2);
+            const u16 r = static_cast<u16>((value >> 12) & 0xF);
+            const u16 g = static_cast<u16>((value >> 8) & 0xF);
+            const u16 b = static_cast<u16>((value >> 4) & 0xF);
+            const u16 a = static_cast<u16>(value & 0xF);
+            rgba8[x * 4 + 0] = static_cast<u8>(r * 17u);
+            rgba8[x * 4 + 1] = static_cast<u8>(g * 17u);
+            rgba8[x * 4 + 2] = static_cast<u8>(b * 17u);
+            rgba8[x * 4 + 3] = static_cast<u8>(a * 17u);
+        }
+        return;
+    default:  // RGBA8
+        std::memcpy(rgba8, src, static_cast<std::size_t>(width) * 4);
+        return;
+    }
+}
+
+// The fog table's 128 entries (two half-precision words each) as a key: the same table gives the same key, so the
+// rasterizer uploads it once.
+u32 FogLutKey(const std::array<u32, 128>& lut) {
+    u32 hash = 2166136261u;
+    for (const u32 entry : lut) {
+        hash = (hash ^ entry) * 16777619u;
+    }
+    return hash != 0 ? hash : 1;  // 0 is "not uploaded"
+}
+
 void Drawer::Draw(const pica::DrawCall& draw) {
     const pica::PicaState& state = *draw.state;
     const auto& regs = state.regs;
     ++stats_.draws;
     // The primitive assembler applies the draw's register side effects first, whatever happens to the draw.
     assembler_.ApplyRegisterWrites(state);
-    if (pica::BitsOf(regs[kRegOutputMerger], 0, 2) == kShadowMode) {
+    const u32 operation_mode = pica::BitsOf(regs[kRegOutputMerger], 0, 2);
+    if (operation_mode == kShadowMode) {
         // A shadow draw renders into no attachment (the shadow map is the Vulkan path's): nothing to show here.
         ++stats_.shadow;
         return;
     }
-    if (!cpuvertex::NeedsCpuPath(draw, assembler_.IsEmpty())) {
-        // An accelerated draw: Azahar draws it with the translated vertex stage, which this path does not have yet.
-        runner_.NoteDraw(draw);
-        ++stats_.accelerated;
+    if (operation_mode == kGasDensityMode) {
+        // The fog's density pass writes a density map, not a picture.
+        ++stats_.gas;
         return;
+    }
+    if (!cpuvertex::NeedsCpuPath(draw, assembler_.IsEmpty())) {
+        // A draw Azahar accelerates on the device's vertex stage: the CPU vertex unit shades it here too, so it is drawn
+        // (correctly, if not as quickly as the Vulkan path's translated shader would).
+        ++stats_.accelerated;
     }
     if (runner_.Run(host_, draw) != cpuvertex::RunStatus::Ok) {
         ++stats_.dropped;
@@ -256,6 +329,16 @@ void Drawer::Draw(const pica::DrawCall& draw) {
     MakeRectangles(regs, height, flipped, &draw_state);
     MakeFixedFunction(regs, flipped, &draw_state);
     MakeCombiner(regs, &draw_state.fragment);
+    const u32 fog_word = regs[kRegFogModeAndMasks];
+    draw_state.fragment.fog_mode = pica::BitsOf(fog_word, 0, 3);
+    draw_state.fragment.fog_flip = pica::BitsOf(fog_word, 16, 1) != 0;
+    const u32 fog_colour = regs[kRegFogColour];
+    for (u32 channel = 0; channel < 3; ++channel) {
+        draw_state.fragment.fog_colour[channel] = static_cast<float>(pica::BitsOf(fog_colour, 8 * channel, 8)) / 255.0f;
+    }
+    // (the table is the state's, not a register's: the game writes it through the LUT data port)
+    draw_state.fragment.fog_lut = state.fog.lut.data();
+    draw_state.fragment.fog_lut_key = FogLutKey(state.fog.lut);
 
     // The draw's textures, unit by unit, decoded by the texture cache: each image is uploaded once per generation.
     texture::TexturesOfDraw(regs.data(), texture_refs_, nullptr);
@@ -285,8 +368,32 @@ void Drawer::Draw(const pica::DrawCall& draw) {
         draw_state.texture_count = static_cast<int>(unit) + 1;
     }
 
+    // The pass's first draw loads the buffer's existing picture from guest memory (the game's fills, and what earlier
+    // passes drew): only then is it needed, so the read is skipped while the pass goes on.
+    render::TargetContents contents;
+    if (!render::IsPassStarted(target_)) {
+        const u32 format = pica::BitsOf(regs[kRegColourFormat], 16, 3);
+        const u32 bpp = PicaBytesPerPixel(format);
+        const u32 stride = width * bpp;
+        bool read = stride != 0;
+        seed_.assign(static_cast<std::size_t>(width) * height * 4, 0);
+        for (u32 y = 0; read && y < height; ++y) {
+            const u8* row = host_.PhysicalPointer(target_.address + y * stride, stride);
+            if (row == nullptr) {
+                read = false;
+                break;
+            }
+            DecodeColourRow(row, width, format, seed_.data() + static_cast<std::size_t>(y) * width * 4);
+        }
+        if (read) {
+            contents.rgba8 = seed_.data();
+            contents.width = width;
+            contents.height = height;
+        }
+    }
+
     std::string error;
-    if (!render::Begin(target_, &error)) {
+    if (!render::Begin(target_, &contents, &error)) {
         ++stats_.failed;
         if (!told_failure_) {
             told_failure_ = true;
@@ -309,7 +416,7 @@ bool Drawer::WriteColourToGuest(u32 address, u32 stride, u32 height, u32 format)
     u32 width = 0;
     u32 rows = 0;
     std::string error;
-    if (!render::ReadTarget(picture_, &width, &rows, &error)) {
+    if (!render::ReadTarget(address, picture_, &width, &rows, &error)) {
         return false;
     }
     rows = std::min(rows, height);

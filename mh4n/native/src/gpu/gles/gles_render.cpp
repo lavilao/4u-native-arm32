@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <unordered_map>
 
 #include "gpu/cpuvertex/triangle_batch.h"
@@ -18,8 +19,6 @@
 namespace mh4n::gpu::gles::render {
 
 namespace {
-
-constexpr const char* kLog = "GlesGpu";
 
 // triangle_batch.h's HardwareVertex: 88 bytes, attributes 0 position, 1 colour, 2 texcoord0, 3 texcoord1, 4 texcoord2,
 // 5 texcoord0_w, 6 normquat, 7 view. The stages here read the position, the colour and the three coordinates.
@@ -82,6 +81,11 @@ uniform int u_update_alpha;
 uniform int u_alpha_test;
 uniform int u_alpha_func;
 uniform int u_alpha_ref;
+
+uniform sampler2D u_fog_lut;
+uniform int u_fog_mode;
+uniform int u_fog_flip;
+uniform vec3 u_fog_colour;
 
 out vec4 o_colour;
 
@@ -379,6 +383,17 @@ void main() {
     if (u_alpha_test != 0 && AlphaTestFails(u_alpha_func, int(previous.a * 255.0))) {
         discard;
     }
+    // The fog (FogMode::Fog): the table the game filled turns the fragment's depth into a factor; the colour is mixed
+    // towards the fog colour by it (gpu/fragment/fog/fog.cpp's WriteFog).
+    if (u_fog_mode == 5) {
+        const float fog_depth = clamp(gl_FragCoord.z, 0.0, 1.0);
+        const float fog_index = (u_fog_flip != 0 ? (1.0 - fog_depth) : fog_depth) * 128.0;
+        const float fog_i = clamp(floor(fog_index), 0.0, 127.0);
+        const float fog_f = fog_index - fog_i;
+        const vec2 entry = texelFetch(u_fog_lut, ivec2(int(fog_i), 0), 0).rg;
+        const float fog_factor = clamp(entry.r + entry.g * fog_f, 0.0, 1.0);
+        previous.rgb = mix(u_fog_colour, previous.rgb, fog_factor);
+    }
     o_colour = previous;
 }
 )";
@@ -388,21 +403,34 @@ struct Uniforms {
     GLint combiner_colour = -1, update_rgb = -1, update_alpha = -1;
     GLint alpha_test = -1, alpha_func = -1, alpha_ref = -1;
     GLint texture[3] = {-1, -1, -1}, has_texture[3] = {-1, -1, -1}, coordinate[3] = {-1, -1, -1};
+    GLint fog_lut = -1, fog_mode = -1, fog_flip = -1, fog_colour = -1;
+};
+
+// One colour buffer's target: a framebuffer with the colour as a texture (so it can be read back) and a depth
+// renderbuffer, kept for as long as the game draws into that buffer. `live` is set at the pass's first draw and cleared
+// by EndFrame, so the picture is loaded from guest memory (and the depth cleared) once a frame, not at every draw.
+struct Surface {
+    GLuint fbo = 0;
+    GLuint colour = 0;
+    GLuint depth = 0;
+    Target target;
+    bool live = false;
+    u64 used = 0;
 };
 
 struct Objects {
     bool built = false;
-    bool started = false;  // a pass is in progress for `target` (Begin started it; EndFrame ends it)
     GLuint program = 0;
     GLuint vao = 0;
     GLuint vbo = 0;
-    GLuint fbo = 0;
-    GLuint colour = 0;  // the colour target, as a texture (so it can be read back)
-    GLuint depth = 0;   // its depth renderbuffer
-    Target target;
-    Target storage;  // the size the attachments have
+    GLuint fog_lut = 0;  // the game's fog table, as a 128x1 RG32F texture (made on first use)
+    u32 fog_lut_key = 0;
+    Surface* current = nullptr;  // the target of the last Begin
+    u64 clock = 0;
     Uniforms uniforms;
-    std::unordered_map<u64, GLuint> images;  // a texture's key -> the GL image of its pixels
+    std::unordered_map<u64, Surface> surfaces;  // a colour buffer (address, size) -> its target
+    std::unordered_map<u64, GLuint> images;     // a texture's key -> the GL image of its pixels
+    std::vector<u8> flipped;                    // the seed, row 0 last (GL's bottom row first)
 };
 
 Objects g_;
@@ -477,6 +505,10 @@ bool Build(std::string* error) {
     u.alpha_test = glGetUniformLocation(program, "u_alpha_test");
     u.alpha_func = glGetUniformLocation(program, "u_alpha_func");
     u.alpha_ref = glGetUniformLocation(program, "u_alpha_ref");
+    u.fog_lut = glGetUniformLocation(program, "u_fog_lut");
+    u.fog_mode = glGetUniformLocation(program, "u_fog_mode");
+    u.fog_flip = glGetUniformLocation(program, "u_fog_flip");
+    u.fog_colour = glGetUniformLocation(program, "u_fog_colour");
     for (int unit = 0; unit < 3; ++unit) {
         const std::string texture = "u_texture" + std::to_string(unit);
         const std::string has = "u_has_texture" + std::to_string(unit);
@@ -521,60 +553,128 @@ bool Build(std::string* error) {
     return true;
 }
 
-// The colour target and its depth: the storage is made (again when its size changes) and the pass starts empty, as the
-// game's first draw into it expects (it fills it).
-bool MakeTarget(const Target& target, std::string* error) {
-    if (g_.fbo == 0) {
-        glGenFramebuffers(1, &g_.fbo);
+// A colour buffer and its size name one target (two screens of one size are two).
+u64 SurfaceKey(const Target& target) {
+    return static_cast<u64>(target.address) | (static_cast<u64>(target.width & 0x7FF) << 32) |
+           (static_cast<u64>(target.height & 0x3FF) << 43);
+}
+
+void DeleteSurface(Surface& surface) {
+    if (surface.fbo != 0) {
+        glDeleteFramebuffers(1, &surface.fbo);
     }
-    if (g_.colour == 0) {
-        glGenTextures(1, &g_.colour);
+    if (surface.colour != 0) {
+        glDeleteTextures(1, &surface.colour);
     }
-    if (g_.depth == 0) {
-        glGenRenderbuffers(1, &g_.depth);
+    if (surface.depth != 0) {
+        glDeleteRenderbuffers(1, &surface.depth);
     }
-    if (!(g_.storage.width == target.width && g_.storage.height == target.height)) {
-        glBindTexture(GL_TEXTURE_2D, g_.colour);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height),
-                     0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindFramebuffer(GL_FRAMEBUFFER, g_.fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_.colour, 0);
-        // The depth buffer the 3D draws test against: 24 bits where the driver makes one, 16 where it does not.
-        const GLenum depth_formats[] = {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT16};
-        GLenum status = GL_FRAMEBUFFER_UNSUPPORTED;
-        for (const GLenum format : depth_formats) {
-            glBindRenderbuffer(GL_RENDERBUFFER, g_.depth);
-            glRenderbufferStorage(GL_RENDERBUFFER, format, static_cast<GLsizei>(target.width),
-                                  static_cast<GLsizei>(target.height));
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_.depth);
-            status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-            if (status == GL_FRAMEBUFFER_COMPLETE) {
-                break;
-            }
+    surface = Surface{};
+}
+
+// The surface's attachments, made (or made again when its size changed): the colour as a texture (so it can be read
+// back) and the depth buffer the 3D draws test against, 24 bits where the driver makes one, 16 where it does not.
+bool MakeAttachments(Surface& surface, std::string* error) {
+    const Target& target = surface.target;
+    if (surface.fbo == 0) {
+        glGenFramebuffers(1, &surface.fbo);
+    }
+    if (surface.colour == 0) {
+        glGenTextures(1, &surface.colour);
+    }
+    if (surface.depth == 0) {
+        glGenRenderbuffers(1, &surface.depth);
+    }
+    glBindTexture(GL_TEXTURE_2D, surface.colour);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height), 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, surface.colour, 0);
+    const GLenum depth_formats[] = {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT16};
+    GLenum status = GL_FRAMEBUFFER_UNSUPPORTED;
+    for (const GLenum format : depth_formats) {
+        glBindRenderbuffer(GL_RENDERBUFFER, surface.depth);
+        glRenderbufferStorage(GL_RENDERBUFFER, format, static_cast<GLsizei>(target.width),
+                              static_cast<GLsizei>(target.height));
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, surface.depth);
+        status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status == GL_FRAMEBUFFER_COMPLETE) {
+            break;
         }
-        if (status != GL_FRAMEBUFFER_COMPLETE) {
-            char why[96];
-            std::snprintf(why, sizeof(why), "the %ux%u target is not complete (0x%04X)", target.width, target.height,
-                          static_cast<unsigned>(status));
-            *error = why;
-            return false;
-        }
-        g_.storage = target;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, g_.fbo);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        char why[96];
+        std::snprintf(why, sizeof(why), "the %ux%u target is not complete (0x%04X)", target.width, target.height,
+                      static_cast<unsigned>(status));
+        *error = why;
+        return false;
+    }
+    return true;
+}
+
+// The pass's first draw: the target's picture is loaded from guest memory (so the game's memory fills, and everything the
+// previous frame drew before its swap, are there), or cleared to opaque black when there is none; the depth starts empty.
+bool StartPass(Surface& surface, const TargetContents* contents, std::string* error) {
+    const Target& target = surface.target;
+    if (!MakeAttachments(surface, error)) {
+        return false;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, surface.fbo);
     glViewport(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height));
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    if (contents != nullptr && contents->rgba8 != nullptr && contents->width == target.width &&
+        contents->height == target.height) {
+        // GL's texture row 0 is the bottom of the picture; the seed's row 0 is the top (the PICA's), as ReadTarget's
+        // flip of the read back says.
+        const std::size_t row = static_cast<std::size_t>(target.width) * 4;
+        g_.flipped.resize(row * target.height);
+        for (u32 y = 0; y < target.height; ++y) {
+            const u8* from = contents->rgba8 + static_cast<std::size_t>(y) * row;
+            std::copy(from, from + row, g_.flipped.data() + static_cast<std::size_t>(target.height - 1 - y) * row);
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glBindTexture(GL_TEXTURE_2D, surface.colour);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(target.width),
+                        static_cast<GLsizei>(target.height), GL_RGBA, GL_UNSIGNED_BYTE, g_.flipped.data());
+    } else {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     glDepthMask(GL_TRUE);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClearDepthf(1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    g_.target = target;
-    g_.started = true;
+    glClear(GL_DEPTH_BUFFER_BIT);
+    surface.live = true;
+    surface.used = ++g_.clock;
+    g_.current = &surface;
     return true;
+}
+
+// Past this many colour buffers (a frame's swaps and a few screens), the least recently used one that is not in a pass
+// goes: the game gets its buffer back with a fresh image (and starts from what memory holds then).
+constexpr std::size_t kMaxSurfaces = 8;
+
+void EvictSurfaces() {
+    while (g_.surfaces.size() > kMaxSurfaces) {
+        Surface* oldest = nullptr;
+        for (auto& [key, surface] : g_.surfaces) {
+            if (surface.live || &surface == g_.current) {
+                continue;
+            }
+            if (oldest == nullptr || surface.used < oldest->used) {
+                oldest = &surface;
+            }
+        }
+        if (oldest == nullptr) {
+            return;
+        }
+        const u64 key = SurfaceKey(oldest->target);
+        DeleteSurface(*oldest);
+        g_.surfaces.erase(key);
+    }
 }
 
 // The GL image of a texture's pixels (uploaded on first sight of its key).
@@ -668,6 +768,61 @@ void SetBlend(const DrawState& state) {
     glBlendColor(state.blend_constant[0], state.blend_constant[1], state.blend_constant[2], state.blend_constant[3]);
 }
 
+// A half-precision word as a float: the fog table's entries are two of them (r at the low word, g at the high one).
+float HalfToFloat(u32 half) {
+    const u32 sign = (half & 0x8000u) << 16;
+    const u32 exponent = (half >> 10) & 0x1Fu;
+    const u32 mantissa = half & 0x3FFu;
+    u32 bits;
+    if (exponent == 0) {
+        bits = sign | (mantissa << 13);
+    } else if (exponent == 31) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+    }
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// The fog: the mode and its flip and colour as uniforms, the game's 128-entry table as an RG32F texture on unit 3 (the
+// entries are uploaded when they changed). A draw with no table has no fog.
+void SetFog(const FragmentState& fragment) {
+    const Uniforms& u = g_.uniforms;
+    const bool fog = fragment.fog_lut != nullptr && (fragment.fog_mode & 7) == 5;
+    glUniform1i(u.fog_mode, fog ? 5 : 0);
+    glUniform1i(u.fog_flip, fragment.fog_flip ? 1 : 0);
+    glUniform3f(u.fog_colour, fragment.fog_colour[0], fragment.fog_colour[1], fragment.fog_colour[2]);
+    if (!fog) {
+        return;
+    }
+    if (g_.fog_lut == 0) {
+        glGenTextures(1, &g_.fog_lut);
+        glBindTexture(GL_TEXTURE_2D, g_.fog_lut);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    if (fragment.fog_lut_key != g_.fog_lut_key) {
+        float values[128 * 2];
+        for (u32 i = 0; i < 128; ++i) {
+            values[i * 2 + 0] = HalfToFloat(fragment.fog_lut[i] & 0xFFFFu);
+            values[i * 2 + 1] = HalfToFloat(fragment.fog_lut[i] >> 16);
+        }
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, g_.fog_lut);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, 128, 1, 0, GL_RG, GL_FLOAT, values);
+        g_.fog_lut_key = fragment.fog_lut_key;
+    }
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, g_.fog_lut);
+    glUniform1i(u.fog_lut, 3);
+    glActiveTexture(GL_TEXTURE0);
+}
+
 void SetCull(const DrawState& state) {
     if (state.cull == 0) {
         glDisable(GL_CULL_FACE);
@@ -682,7 +837,12 @@ void SetCull(const DrawState& state) {
 
 }  // namespace
 
-bool Begin(const Target& target, std::string* error) {
+bool IsPassStarted(const Target& target) {
+    const auto it = g_.surfaces.find(SurfaceKey(target));
+    return it != g_.surfaces.end() && it->second.live;
+}
+
+bool Begin(const Target& target, const TargetContents* contents, std::string* error) {
     if (!MakeCurrent(error)) {
         return false;
     }
@@ -693,32 +853,38 @@ bool Begin(const Target& target, std::string* error) {
     if (!g_.built && !Build(error)) {
         return false;
     }
-    // A draw into another framebuffer (the other screen, or the frame after a swap) starts its pass: the target's
-    // picture is cleared for it.
-    if (!g_.started || !(g_.target == target)) {
-        if (!MakeTarget(target, error)) {
-            return false;
-        }
+    // A draw into another colour buffer (the other screen, or the frame after a swap) starts that buffer's pass: its
+    // picture is loaded once, at the first draw into it.
+    Surface* surface = &g_.surfaces[SurfaceKey(target)];
+    surface->target = target;
+    surface->used = ++g_.clock;
+    if (!surface->live && !StartPass(*surface, contents, error)) {
+        return false;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, g_.fbo);
-    glViewport(0, 0, static_cast<GLsizei>(g_.storage.width), static_cast<GLsizei>(g_.storage.height));
+    EvictSurfaces();
+    surface = &g_.surfaces[SurfaceKey(target)];
+    g_.current = surface;
+    glBindFramebuffer(GL_FRAMEBUFFER, surface->fbo);
+    glViewport(0, 0, static_cast<GLsizei>(surface->target.width), static_cast<GLsizei>(surface->target.height));
     glDisable(GL_SCISSOR_TEST);
     return true;
 }
 
 void EndFrame() {
-    g_.started = false;
+    for (auto& [key, surface] : g_.surfaces) {
+        surface.live = false;
+    }
 }
 
 bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std::string* error) {
     if (count == 0) {
         return true;
     }
-    if (!g_.built || g_.fbo == 0) {
+    if (!g_.built || g_.current == nullptr) {
         *error = "the rasterizer has no target (Begin makes it)";
         return false;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, g_.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_.current->fbo);
     glUseProgram(g_.program);
     glViewport(static_cast<GLint>(state.viewport_x), static_cast<GLint>(state.viewport_y),
                static_cast<GLsizei>(state.viewport_width), static_cast<GLsizei>(state.viewport_height));
@@ -785,6 +951,7 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
         glUniform1i(u.has_texture[unit], set ? 1 : 0);
         glUniform1i(u.coordinate[unit], static_cast<GLint>(set ? std::min(state.textures[unit].coordinate, 2u) : 0u));
     }
+    SetFog(state.fragment);
 
     glBindVertexArray(g_.vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_.vbo);
@@ -801,14 +968,31 @@ bool DrawTriangles(const void* vertices, u32 count, const DrawState& state, std:
     return true;
 }
 
-bool ReadTarget(std::vector<u8>& out, u32* width, u32* height, std::string* error) {
-    if (!g_.built || g_.fbo == 0) {
+bool ReadTarget(u32 address, std::vector<u8>& out, u32* width, u32* height, std::string* error) {
+    if (!g_.built) {
         *error = "there is no target to read";
         return false;
     }
-    const u32 w = g_.storage.width, h = g_.storage.height;
+    // The buffer the game swapped, when a draw went into it; otherwise the last one drawn.
+    Surface* surface = nullptr;
+    for (auto& [key, candidate] : g_.surfaces) {
+        if (candidate.target.address != address) {
+            continue;
+        }
+        if (surface == nullptr || candidate.live) {
+            surface = &candidate;
+        }
+    }
+    if (surface == nullptr) {
+        surface = g_.current;
+    }
+    if (surface == nullptr) {
+        *error = "there is no target to read";
+        return false;
+    }
+    const u32 w = surface->target.width, h = surface->target.height;
     out.resize(static_cast<std::size_t>(w) * h * 4);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, surface->fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE, out.data());
     const GLenum error_gl = glGetError();
@@ -836,8 +1020,13 @@ std::string Describe() {
     if (!g_.built) {
         return "no program yet";
     }
-    return "the combiner program, a " + std::to_string(g_.storage.width) + "x" + std::to_string(g_.storage.height) +
-           " target, " + std::to_string(g_.images.size()) + " textures";
+    std::string text = "the combiner program, " + std::to_string(g_.surfaces.size()) + " colour buffers, " +
+                       std::to_string(g_.images.size()) + " textures";
+    if (g_.current != nullptr) {
+        text += ", the last " + std::to_string(g_.current->target.width) + "x" +
+                std::to_string(g_.current->target.height);
+    }
+    return text;
 }
 
 void Forget() {
@@ -849,12 +1038,14 @@ void Forget() {
         glDeleteTextures(1, &gone);
     }
     g_.images.clear();
-    GLuint vao = g_.vao, vbo = g_.vbo, fbo = g_.fbo, colour = g_.colour, depth = g_.depth, program = g_.program;
+    for (auto& [key, surface] : g_.surfaces) {
+        DeleteSurface(surface);
+    }
+    g_.surfaces.clear();
+    GLuint vao = g_.vao, vbo = g_.vbo, program = g_.program, fog_lut = g_.fog_lut;
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &vbo);
-    glDeleteFramebuffers(1, &fbo);
-    glDeleteTextures(1, &colour);
-    glDeleteRenderbuffers(1, &depth);
+    glDeleteTextures(1, &fog_lut);
     glDeleteProgram(program);
     g_ = Objects{};
 }
@@ -869,7 +1060,11 @@ namespace {
 const char* const kNoGles = "the GLES renderer is built for Android only";
 }
 
-bool Begin(const Target&, std::string* error) {
+bool IsPassStarted(const Target&) {
+    return false;
+}
+
+bool Begin(const Target&, const TargetContents*, std::string* error) {
     *error = kNoGles;
     return false;
 }
@@ -881,7 +1076,7 @@ bool DrawTriangles(const void*, u32, const DrawState&, std::string* error) {
     return false;
 }
 
-bool ReadTarget(std::vector<u8>&, u32* width, u32* height, std::string* error) {
+bool ReadTarget(u32, std::vector<u8>&, u32* width, u32* height, std::string* error) {
     *width = 0;
     *height = 0;
     *error = kNoGles;

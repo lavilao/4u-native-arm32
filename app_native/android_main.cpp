@@ -767,7 +767,7 @@ int main(int argc, char* argv[]) {
             }
             Logf("renderer: GLES (gpu/gles), an OpenGL ES context of its own, not the Vulkan driver");
         } else if (renderer != "vulkan" && renderer != "Vulkan") {
-            Logf("renderer: \"" + renderer + "\" is not one: Vulkan is used (vulkan|gles)");
+            Logf("renderer: \"%s\" is not one: Vulkan is used (vulkan|gles)", renderer.c_str());
         }
         if (launch.count("args")) {
             std::istringstream extra(launch["args"]);
