@@ -580,6 +580,22 @@ u64 Drawer::WriteBackDrawn() {
                     }
                 }
             }
+            // What the rasterizer made, once: a picture that is all black here means the draws made nothing, whatever
+            // the screens then do with it.
+            if (!told_picture_) {
+                told_picture_ = true;
+                u64 lit = 0;
+                for (std::size_t i = 0; i < static_cast<std::size_t>(width) * height; ++i) {
+                    const u8* p = rgba8 + i * 4;
+                    lit += (p[0] | p[1] | p[2]) != 0 ? 1 : 0;
+                }
+                const u8* centre = rgba8 + (static_cast<std::size_t>(height / 2) * width + width / 2) * 4;
+                MH4N_LOG(Info, kLog,
+                         "the first picture into guest memory: {}x{} format {} at {:#010x}: {} of {} pixels are not "
+                         "black, the centre is r {} g {} b {} a {}",
+                         width, height, format, address, lit, static_cast<u64>(width) * height, centre[0], centre[1],
+                         centre[2], centre[3]);
+            }
             // The picture is in guest memory now: a texture that overlaps it is out of date in the cache.
             textures_.OnFlush(address, static_cast<u32>((height + 7) / 8 * tile_row));
             ++written;

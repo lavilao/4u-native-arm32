@@ -710,6 +710,8 @@ struct Surface {
     Target target;
     bool live = false;
     bool dirty = false;  // a draw landed in it since the last write-back into guest memory
+    bool told = false;   // (the first write-back of it, logged once)
+    u64 draws = 0;       // draws into it since it was made
     u64 used = 0;
 };
 
@@ -1642,6 +1644,7 @@ bool Submit(const DrawState& state, const std::function<void()>& issue, std::str
         return false;
     }
     g_.current->dirty = true;  // the picture its guest memory holds is out of date until the next write-back
+    ++g_.current->draws;
     return true;
 }
 
@@ -1978,6 +1981,11 @@ bool WriteBackDrawn(const StorePicture& store) {
                      surface.target.width, surface.target.height);
             ok = false;
             continue;
+        }
+        if (!surface.told) {
+            surface.told = true;
+            MH4N_LOG(Info, kLog, "a colour buffer is written back: {}x{} format {} at {:#010x}, {} draw(s) into it", w,
+                     h, surface.target.format, surface.target.address, surface.draws);
         }
         if (!store(surface.target.address, w, h, surface.target.format, pixels.data())) {
             ok = false;
