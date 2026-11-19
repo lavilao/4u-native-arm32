@@ -67,6 +67,16 @@ Platform& P() {
     return *platform;
 }
 
+/// Sets a variable for this process (the native renderer's own switches are read from the environment, at its first
+/// draw: gpu/native's MH4N_* names, which the options below stand for).
+void SetEnvironment(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
 template <typename... Args>
 void LogInfo(fmt::format_string<Args...> format, Args&&... args) {
     P().Log(LogLevel::Info, fmt::format(format, std::forward<Args>(args)...));
@@ -199,6 +209,17 @@ struct Options {
     // after Heavenfall's arrangement); off unless set
     bool single_screen = false;
     bool effects = true;    // effects / MH4U_EFFECTS = off: the game's particle effects are not drawn (Effects below)
+    // The native renderer's own switches (gpu/native reads them from the environment at its first draw; Install sets
+    // them here, so a phone whose picture is wrong can try them in mh4u.ini, one at a time, without another build).
+    int gpu_counters = 0;   // gpu_counters / MH4U_GPU_COUNTERS: every N top-screen VBlanks, the renderer's non-zero
+                            // frame counters in the log (draws dropped, the stubbed features, textures; 1 also times
+                            // the frame). A debug aid: it costs a clock read a draw.
+    bool touch_skip = true; // touch_skip / MH4U_TOUCH_SKIP = off: the hidden touch screen's draws are made too
+    int target_screens = -1;  // target_screens / MH4U_TARGET_SCREENS: 1 the top screen shown from the target's own
+                              // picture, 0 from an upright copy of it; unset: the renderer's choice for the GPU
+    int target_eager = -1;  // target_eager / MH4U_TARGET_EAGER: 0 a screen's picture is handed over at the next transfer
+                            // that reads its target, a write or the VBlank, never at its own transfer; unset: the
+                            // renderer's own
     // hud_<part> = dx dy: a part of the hunting HUD moved by this much (top-screen pixels, right and down: the app's
     // layout editor drags it; item_bar is hud_items as an earlier version wrote it)
     float hud_dx[HUD_PART_COUNT] = {}, hud_dy[HUD_PART_COUNT] = {};
@@ -402,6 +423,14 @@ void Set(Options& o, const std::string& key, const std::string& value) {
         o.single_screen = IsOn(value);
     } else if (key == "effects") {
         o.effects = !IsOff(value);
+    } else if (key == "gpu_counters") {
+        o.gpu_counters = static_cast<int>(std::max(0L, std::strtol(value.c_str(), nullptr, 10)));
+    } else if (key == "touch_skip") {
+        o.touch_skip = IsOn(value);
+    } else if (key == "target_screens") {
+        o.target_screens = IsOff(value) ? 0 : 1;  // (1 the target's own picture, 0 the upright copy)
+    } else if (key == "target_eager") {
+        o.target_eager = IsOn(value) ? 1 : 0;
     } else if (key == "trace_state") {
         o.trace_state = IsOn(value) || value == "actions";
         o.trace_state_actions = value == "actions";
@@ -487,7 +516,11 @@ Options LoadOptions(std::vector<std::string>& log) {
         {"MH4U_QOL_REWARDS_NO_LIMIT", "qol_rewards_no_limit"},
         {"MH4U_REWARDS_SEND_ALL", "rewards_send_all"},
         {"MH4U_SINGLE_SCREEN", "single_screen"},
-        {"MH4U_EFFECTS", "effects"}};
+        {"MH4U_EFFECTS", "effects"},
+        {"MH4U_GPU_COUNTERS", "gpu_counters"},
+        {"MH4U_TOUCH_SKIP", "touch_skip"},
+        {"MH4U_TARGET_SCREENS", "target_screens"},
+        {"MH4U_TARGET_EAGER", "target_eager"}};
     for (const auto& [var, key] : env) {
         if (const char* value = std::getenv(var)) {
             Set(o, key, value);
@@ -3052,6 +3085,28 @@ void SetWindowSize(std::uint32_t width, std::uint32_t height) {
 std::vector<std::string> Install(const RCodeInfo& info) {
     std::vector<std::string> log;
     options = LoadOptions(log);
+    // The native renderer's switches (native_gpu.h's MH4N_* variables): set before the game's first draw, which is
+    // where the renderer is made. Each is left alone unless mh4u.ini (or its MH4U_* variable) asks for it, so the
+    // renderer's own choice stands.
+    if (options.gpu_counters > 0) {
+        SetEnvironment("MH4N_GPU_COUNTERS", fmt::format("{}", options.gpu_counters));
+        log.push_back(fmt::format("renderer counters every {} VBlanks", options.gpu_counters));
+    }
+    if (!options.touch_skip) {
+        SetEnvironment("MH4N_TOUCH_SKIP", "0");
+        log.push_back("the hidden touch screen's draws are made too");
+    }
+    if (options.target_screens >= 0) {
+        SetEnvironment("MH4N_TARGET_SCREENS", options.target_screens != 0 ? "1" : "0");
+        log.push_back(options.target_screens != 0 ? "the top screen from the target's own picture"
+                                                 : "the top screen from an upright copy");
+    }
+    if (options.target_eager >= 0) {
+        SetEnvironment("MH4N_TARGET_EAGER", options.target_eager != 0 ? "1" : "0");
+        log.push_back(options.target_eager != 0
+                          ? "a screen's picture handed over at its own transfer"
+                          : "a screen's picture handed over at the next transfer or the VBlank");
+    }
     if (options.widescreen_match) {
         // "match": the top screen takes the window's shape. It has to be resolved here, before
         // the game's first area (the layout and the code's size tunables are fixed in this
