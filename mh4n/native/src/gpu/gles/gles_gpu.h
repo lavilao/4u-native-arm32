@@ -60,6 +60,7 @@ private:
     bool has_swap_[2] = {false, false};
     bool has_context_ = false;
     bool told_swap_[2] = {false, false};  // the first swap of each screen, with its framebuffer registers
+    bool told_transfer_ = false;          // the first display transfer, with the addresses it reads and writes
     u64 writebacks_ = 0;
     u64 vblanks_ = 0;  // top-screen VBlanks (the heartbeat's clock)
 };

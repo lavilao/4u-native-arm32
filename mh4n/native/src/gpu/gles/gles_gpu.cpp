@@ -42,6 +42,21 @@ void GlesGpu::Execute(const GxCommand& command) {
         processor_.SubmitGxCmdList(ToPhysical(command.words[1]), command.words[2]);
         return;
     }
+    if (id == static_cast<u32>(gx::CommandId::DisplayTransfer) && !told_transfer_) {
+        // What the transfer reads (the buffer the write-back has to fill) and writes, and how: a black screen says
+        // nothing about where the game looks for its scene buffer.
+        told_transfer_ = true;
+        const u32 in_w = command.words[3] & 0xFFFF, in_h = command.words[3] >> 16;
+        const u32 out_w = command.words[4] & 0xFFFF, out_h = command.words[4] >> 16;
+        const u32 flags = command.words[5];
+        MH4N_LOG(Info, kLog,
+                 "the first display transfer: {}x{} format {} at {:#010x} -> {}x{} format {} at {:#010x}; flags {:#x} "
+                 "(flip {}, input linear {}, crop {}, texture copy {}, no swizzle {}, scaling {}); the draws' last "
+                 "buffer {:#010x}",
+                 in_w, in_h, (flags >> 8) & 7, ToPhysical(command.words[1]), out_w, out_h, (flags >> 12) & 7,
+                 ToPhysical(command.words[2]), flags, flags & 1, (flags >> 1) & 1, (flags >> 2) & 1, (flags >> 3) & 1,
+                 (flags >> 5) & 1, (flags >> 24) & 3, drawer_.target().address);
+    }
     // The engine's blitter (a fill, a display transfer, a texture copy) reads and writes guest memory: what the draws
     // made has to be in it first. This is how a frame reaches the screens — the game transfers its scene buffer into
     // the LCD framebuffer, which display_mem then reads.
