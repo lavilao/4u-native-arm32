@@ -707,10 +707,11 @@ TEST_CASE("PhysicalPointer: VRAM, DSP RAM and FCRAM through the linear heap") {
     CHECK(memory->PhysicalPointer(0x19000000, 4) == nullptr);
     CHECK(memory->PhysicalPointer(0x1FF80000, 4) == nullptr);
 
-    // FCRAM has no view until the linear heap is set
+    // FCRAM's view is the block its bytes are the backing of, whether or not the loader has named
+    // the linear heap's window: a block mapped outside that window still shows its FCRAM.
     REQUIRE(memory->Map(0x14100000, 0x2000, RW, MemState::Continuous, 0x20100000) == 0);
     CHECK(memory->LinearHeapArea() == 0);
-    CHECK(memory->PhysicalPointer(0x20100000, 0x2000) == nullptr);
+    CHECK(memory->PhysicalPointer(0x20100000, 0x2000) == base + 0x14100000);
     memory->SetLinearHeapArea(kLinearHeapVaddr);
     CHECK(memory->LinearHeapArea() == 0x14000000);
     // vaddr = paddr - 0x20000000 + 0x14000000
@@ -727,13 +728,30 @@ TEST_CASE("PhysicalPointer: VRAM, DSP RAM and FCRAM through the linear heap") {
 
     // the New 3DS kernel's linear heap
     memory->SetLinearHeapArea(kNewLinearHeapVaddr);
-    CHECK(memory->PhysicalPointer(0x20100000, 0x2000) == nullptr); // nothing mapped there
+    // nothing is mapped at the new window, but the old one still shows the block's FCRAM
+    CHECK(memory->PhysicalPointer(0x20100000, 0x2000) == base + 0x14100000);
     REQUIRE(memory->Map(0x30000000, 0x1000, RW, MemState::Continuous, 0x20000000) == 0);
     CHECK(memory->PhysicalPointer(0x20000000, 0x1000) == base + 0x30000000);
 
     // after an Unmap the view is gone
     REQUIRE(memory->Unmap(0x30000000, 0x1000) == 0);
     CHECK(memory->PhysicalPointer(0x20000000, 0x1000) == nullptr);
+
+    // A heap block backed by FCRAM is a view of those bytes too (svcControlMemory maps heap pieces
+    // with the FCRAM they came from), and a block without a backing is not.
+    REQUIRE(memory->Map(0x08000000, 0x1000, RW, MemState::Private, 0x24076000) == 0);
+    CHECK(memory->PhysicalPointer(0x24076000, 0x1000) == base + 0x08000000);
+    REQUIRE(memory->Map(0x08100000, 0x1000, RW, MemState::Private) == 0);
+    CHECK(memory->PhysicalPointer(0x24075000, 0x1000) == nullptr);
+    CHECK(memory->PhysicalPointer(0x24075000, 0x800) == nullptr);
+    CHECK(memory->PhysicalPointer(0x24077000, 0x1000) == nullptr);
+    // the range must lie in one view: a byte past the block is not shown
+    CHECK(memory->PhysicalPointer(0x24076FFF, 2) == nullptr);
+    CHECK(memory->PhysicalPointer(0x24076FFF, 1) == base + 0x08000FFF);
+    // ... and the GPU's own window for a game's fixed buffers (the GSP's blocks keep the old one)
+    memory->SetLinearHeapArea(kNewLinearHeapVaddr);
+    REQUIRE(memory->Map(0x14076000, 0x2000, RW, MemState::Continuous, 0x24076000) == 0);
+    CHECK(memory->PhysicalPointer(0x24076800, 0x1000) == base + 0x14076800);
 }
 
 TEST_CASE("VirtualToPhysical for VRAM, the linear heaps and DSP RAM") {

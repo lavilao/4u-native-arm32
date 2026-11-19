@@ -538,10 +538,7 @@ u8* GuestMemory::PhysicalPointer(u32 paddr, u32 size) const {
     } else if (paddr >= kDspRamPaddr && end <= static_cast<u64>(kDspRamPaddr) + kDspRamSize) {
         vaddr = static_cast<u64>(kDspRamVaddr) + (paddr - kDspRamPaddr);
     } else if (paddr >= kFcramPaddr && end <= static_cast<u64>(kFcramPaddr) + kFcramSize) {
-        if (linear_heap_area_ == 0) {
-            return nullptr; // the loader has not set the linear heap yet
-        }
-        vaddr = static_cast<u64>(linear_heap_area_) + (paddr - kFcramPaddr);
+        return FcramPointerLocked(paddr, static_cast<u32>(length));
     } else {
         return nullptr;
     }
@@ -550,6 +547,79 @@ u8* GuestMemory::PhysicalPointer(u32 paddr, u32 size) const {
         return nullptr;
     }
     return base_ + vaddr;
+}
+
+bool GuestMemory::FcramViewLocked(u32 vaddr, u32 paddr, u32 length) const {
+    const u64 end = static_cast<u64>(vaddr) + length;
+    if (vaddr >= kManagedEnd || end > kManagedEnd) {
+        return false;
+    }
+    u64 covered = 0;
+    for (auto it = FindBlock(vaddr); it != blocks_.end() && it->first < end; ++it) {
+        const u64 lo = std::max<u64>(it->first, vaddr);
+        const u64 hi = std::min<u64>(static_cast<u64>(it->first) + it->second.size, end);
+        if (hi <= lo) {
+            continue;
+        }
+        const Block& block = it->second;
+        if (!block.mapped || block.backing == kNoBacking) {
+            return false;
+        }
+        // These bytes are that FCRAM: the same offset into the block's backing.
+        if (block.backing + (lo - it->first) != static_cast<u64>(paddr) + (lo - vaddr)) {
+            return false;
+        }
+        covered += hi - lo;
+    }
+    return covered == length;
+}
+
+// FCRAM's guest view: the window its bytes are mapped at. The loader's linear heap is the common one, but it is not
+// the only one: the GSP's own blocks (and the shared font, kernel/shared_memory.cpp) are mapped in the old linear heap
+// window whatever the kernel version, and a heap block can be FCRAM-backed too. A game hands the PICA the physical
+// addresses the GSP gave it, so assuming the loader's window left those buffers unreadable: MH4U's colour buffer at
+// 0x24076800 was mapped at 0x14076800, and every display transfer that read it found nothing.
+u8* GuestMemory::FcramPointerLocked(u32 paddr, u32 length) const {
+    const u32 offset = paddr - kFcramPaddr;
+    const u64 generation = map_changes_.load(std::memory_order_acquire);
+    if (generation != fcram_views_generation_) {
+        fcram_views_.fill(FcramView{});
+        fcram_views_generation_ = generation;
+    }
+    FcramView& cached = fcram_views_[(offset >> 12) % fcram_views_.size()];
+    if (cached.offset == offset && FcramViewLocked(cached.vaddr, paddr, length)) {
+        return base_ + cached.vaddr;
+    }
+    // The windows a block of FCRAM is mapped at: the linear heap the loader named, and the old one the GSP's blocks
+    // keep to.
+    const u32 windows[] = {linear_heap_area_, kLinearHeapVaddr, kNewLinearHeapVaddr};
+    for (const u32 window : windows) {
+        if (window == 0) {
+            continue;
+        }
+        const u64 vaddr = static_cast<u64>(window) + offset;
+        if (vaddr < kManagedEnd && FcramViewLocked(static_cast<u32>(vaddr), paddr, length)) {
+            cached.offset = offset;
+            cached.vaddr = static_cast<u32>(vaddr);
+            return base_ + vaddr;
+        }
+    }
+    // Any other block those bytes are the backing of (a heap allocation from FCRAM, a shared memory's piece).
+    for (auto it = blocks_.begin(); it != blocks_.end(); ++it) {
+        const Block& block = it->second;
+        if (!block.mapped || block.backing == kNoBacking) {
+            continue;
+        }
+        if (static_cast<u64>(paddr) < block.backing ||
+            block.backing + block.size < static_cast<u64>(paddr) + length) {
+            continue;
+        }
+        const u32 vaddr = it->first + static_cast<u32>(paddr - block.backing);
+        cached.offset = offset;
+        cached.vaddr = vaddr;
+        return base_ + vaddr;
+    }
+    return nullptr;
 }
 
 std::optional<u32> GuestMemory::VirtualToPhysical(u32 vaddr) const {

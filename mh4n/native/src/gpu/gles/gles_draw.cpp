@@ -240,6 +240,55 @@ void EncodeColourPixel(const u8* p, u32 format, u8* out) {
     }
 }
 
+// One PICA colour format pixel (`bpp` bytes at `in`) as RGBA8: the tiled buffers this renderer loads and writes back
+// hold them, so a buffer's existing picture is decoded pixel by pixel.
+void DecodeColourPixel(const u8* in, u32 format, u8* out) {
+    switch (format & 7) {
+    case 1:  // RGB8
+        out[0] = in[0];
+        out[1] = in[1];
+        out[2] = in[2];
+        out[3] = 255;
+        return;
+    case 2: {  // RGB5A1
+        u16 value = 0;
+        std::memcpy(&value, in, 2);
+        const u16 r = static_cast<u16>((value >> 11) & 0x1F);
+        const u16 g = static_cast<u16>((value >> 6) & 0x1F);
+        const u16 b = static_cast<u16>((value >> 1) & 0x1F);
+        out[0] = static_cast<u8>((r * 255u + 15u) / 31u);
+        out[1] = static_cast<u8>((g * 255u + 15u) / 31u);
+        out[2] = static_cast<u8>((b * 255u + 15u) / 31u);
+        out[3] = (value & 1) != 0 ? 255 : 0;
+        return;
+    }
+    case 3: {  // RGB565
+        u16 value = 0;
+        std::memcpy(&value, in, 2);
+        const u16 r = static_cast<u16>((value >> 11) & 0x1F);
+        const u16 g = static_cast<u16>((value >> 5) & 0x3F);
+        const u16 b = static_cast<u16>(value & 0x1F);
+        out[0] = static_cast<u8>((r * 255u + 15u) / 31u);
+        out[1] = static_cast<u8>((g * 255u + 31u) / 63u);
+        out[2] = static_cast<u8>((b * 255u + 15u) / 31u);
+        out[3] = 255;
+        return;
+    }
+    case 4: {  // RGBA4
+        u16 value = 0;
+        std::memcpy(&value, in, 2);
+        out[0] = static_cast<u8>(((value >> 12) & 0xF) * 17u);
+        out[1] = static_cast<u8>(((value >> 8) & 0xF) * 17u);
+        out[2] = static_cast<u8>(((value >> 4) & 0xF) * 17u);
+        out[3] = static_cast<u8>((value & 0xF) * 17u);
+        return;
+    }
+    default:  // RGBA8
+        std::memcpy(out, in, 4);
+        return;
+    }
+}
+
 }  // namespace
 
 void EncodeColourRow(const u8* rgba8, u32 width, u32 format, u8* out) {
@@ -248,62 +297,6 @@ void EncodeColourRow(const u8* rgba8, u32 width, u32 format, u8* out) {
     for (u32 x = 0; x < width; ++x) {
         EncodeColourPixel(rgba8 + static_cast<std::size_t>(x) * 4, format, pixel);
         std::memcpy(out + static_cast<std::size_t>(x) * bpp, pixel, bpp);
-    }
-}
-
-void DecodeColourRow(const u8* src, u32 width, u32 format, u8* rgba8) {
-    switch (format & 7) {
-    case 1:  // RGB8
-        for (u32 x = 0; x < width; ++x) {
-            rgba8[x * 4 + 0] = src[x * 3 + 0];
-            rgba8[x * 4 + 1] = src[x * 3 + 1];
-            rgba8[x * 4 + 2] = src[x * 3 + 2];
-            rgba8[x * 4 + 3] = 255;
-        }
-        return;
-    case 2:  // RGB5A1: rrrrrgggggbbbbba
-        for (u32 x = 0; x < width; ++x) {
-            u16 value = 0;
-            std::memcpy(&value, src + x * 2, 2);
-            const u16 r = static_cast<u16>((value >> 11) & 0x1F);
-            const u16 g = static_cast<u16>((value >> 6) & 0x1F);
-            const u16 b = static_cast<u16>((value >> 1) & 0x1F);
-            rgba8[x * 4 + 0] = static_cast<u8>((r * 255u + 15u) / 31u);
-            rgba8[x * 4 + 1] = static_cast<u8>((g * 255u + 15u) / 31u);
-            rgba8[x * 4 + 2] = static_cast<u8>((b * 255u + 15u) / 31u);
-            rgba8[x * 4 + 3] = (value & 1) != 0 ? 255 : 0;
-        }
-        return;
-    case 3:  // RGB565: rrrrrggggggbbbbb
-        for (u32 x = 0; x < width; ++x) {
-            u16 value = 0;
-            std::memcpy(&value, src + x * 2, 2);
-            const u16 r = static_cast<u16>((value >> 11) & 0x1F);
-            const u16 g = static_cast<u16>((value >> 5) & 0x3F);
-            const u16 b = static_cast<u16>(value & 0x1F);
-            rgba8[x * 4 + 0] = static_cast<u8>((r * 255u + 15u) / 31u);
-            rgba8[x * 4 + 1] = static_cast<u8>((g * 255u + 31u) / 63u);
-            rgba8[x * 4 + 2] = static_cast<u8>((b * 255u + 15u) / 31u);
-            rgba8[x * 4 + 3] = 255;
-        }
-        return;
-    case 4:  // RGBA4: rrrrggggbbbbaaaa
-        for (u32 x = 0; x < width; ++x) {
-            u16 value = 0;
-            std::memcpy(&value, src + x * 2, 2);
-            const u16 r = static_cast<u16>((value >> 12) & 0xF);
-            const u16 g = static_cast<u16>((value >> 8) & 0xF);
-            const u16 b = static_cast<u16>((value >> 4) & 0xF);
-            const u16 a = static_cast<u16>(value & 0xF);
-            rgba8[x * 4 + 0] = static_cast<u8>(r * 17u);
-            rgba8[x * 4 + 1] = static_cast<u8>(g * 17u);
-            rgba8[x * 4 + 2] = static_cast<u8>(b * 17u);
-            rgba8[x * 4 + 3] = static_cast<u8>(a * 17u);
-        }
-        return;
-    default:  // RGBA8
-        std::memcpy(rgba8, src, static_cast<std::size_t>(width) * 4);
-        return;
     }
 }
 
@@ -472,18 +465,28 @@ void Drawer::Draw(const pica::DrawCall& draw) {
     // passes drew): only then is it needed, so the read is skipped while the pass goes on.
     render::TargetContents contents;
     if (!render::IsPassStarted(target_)) {
+        // (the buffer is stored in rows of 8x8 tiles in Morton order, as the write-back stores it and the GX engine's
+        // blits read it: a linear read of it would load garbage)
         const u32 format = colour_format;
         const u32 bpp = PicaBytesPerPixel(format);
-        const u32 stride = width * bpp;
-        bool read = stride != 0;
+        const std::size_t tile_row = static_cast<std::size_t>(width) * 8 * bpp;
+        bool read = width != 0 && height != 0;
         seed_.assign(static_cast<std::size_t>(width) * height * 4, 0);
-        for (u32 y = 0; read && y < height; ++y) {
-            const u8* row = host_.PhysicalPointer(target_.address + y * stride, stride);
-            if (row == nullptr) {
+        for (u32 first = 0; read && first < height; first += 8) {
+            const u32 rows = std::min(8u, height - first);
+            const u8* tiles = host_.PhysicalPointer(target_.address + static_cast<u32>(first / 8 * tile_row),
+                                                    static_cast<u32>(tile_row));
+            if (tiles == nullptr) {
                 read = false;
                 break;
             }
-            DecodeColourRow(row, width, format, seed_.data() + static_cast<std::size_t>(y) * width * 4);
+            for (u32 y = first; y < first + rows; ++y) {
+                u8* row = seed_.data() + static_cast<std::size_t>(y) * width * 4;
+                for (u32 x = 0; x < width; ++x) {
+                    DecodeColourPixel(tiles + gx::MortonOffset(x, y, bpp), format,
+                                      row + static_cast<std::size_t>(x) * 4);
+                }
+            }
         }
         if (read) {
             contents.rgba8 = seed_.data();
@@ -559,19 +562,23 @@ u64 Drawer::WriteBackDrawn() {
             // MortonOffset, the layout every blit of the engine reads).
             const std::size_t tile_row = static_cast<std::size_t>(width) * 8 * bpp;
             u8 pixel[4];
+            u32 rows_written = 0, rows_missing = 0;
+            u32 first_written = 0, end_written = 0;
             for (u32 first = 0; first < height; first += 8) {
                 const u32 rows = std::min(8u, height - first);
                 u8* out = host_.PhysicalPointer(address + static_cast<u32>(first / 8 * tile_row),
                                                 static_cast<u32>(tile_row));
                 if (out == nullptr) {
-                    if (!told_writeback_) {
-                        told_writeback_ = true;
-                        MH4N_LOG(Error, kLog, "the {}x{} picture is not written into guest memory: its rows of tiles at "
-                                              "{:#010x} are not in memory",
-                                 width, height, address + static_cast<u32>(first / 8 * tile_row));
-                    }
-                    return false;
+                    ++rows_missing;
+                    continue;
                 }
+                // (a row of tiles the guest does not have mapped loses that row, not the picture: what is there is
+                // still shown, and the log says how much is not)
+                if (rows_written == 0) {
+                    first_written = first;
+                }
+                end_written = first + rows;
+                ++rows_written;
                 for (u32 y = first; y < first + rows; ++y) {
                     const u8* row = rgba8 + static_cast<std::size_t>(y) * width * 4;
                     for (u32 x = 0; x < width; ++x) {
@@ -579,6 +586,21 @@ u64 Drawer::WriteBackDrawn() {
                         std::memcpy(out + gx::MortonOffset(x, y, bpp), pixel, bpp);
                     }
                 }
+            }
+            if (rows_written == 0) {
+                if (!told_writeback_) {
+                    told_writeback_ = true;
+                    MH4N_LOG(Error, kLog, "the {}x{} picture at {:#010x} (format {}, {} bytes a row of tiles) is not in "
+                                          "guest memory: none of its {} row(s) of tiles is mapped",
+                             width, height, address, format, tile_row, (height + 7) / 8);
+                }
+                return false;
+            }
+            if (rows_missing != 0 && !told_writeback_) {
+                told_writeback_ = true;
+                MH4N_LOG(Error, kLog, "the {}x{} picture at {:#010x} (format {}, {} bytes a row of tiles) is only "
+                                      "partly in guest memory: {} of its {} row(s) of tiles are not mapped",
+                         width, height, address, format, tile_row, rows_missing, (height + 7) / 8);
             }
             // What the rasterizer made, once: a picture that is all black here means the draws made nothing, whatever
             // the screens then do with it.
@@ -597,7 +619,8 @@ u64 Drawer::WriteBackDrawn() {
                          centre[2], centre[3]);
             }
             // The picture is in guest memory now: a texture that overlaps it is out of date in the cache.
-            textures_.OnFlush(address, static_cast<u32>((height + 7) / 8 * tile_row));
+            textures_.OnFlush(address + static_cast<u32>(first_written / 8 * tile_row),
+                              static_cast<u32>((end_written - first_written + 7) / 8 * tile_row));
             ++written;
             return true;
         });

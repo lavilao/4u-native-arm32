@@ -250,11 +250,17 @@ public:
     // version (the loader sets it, N1-03). Until it is set, FCRAM has no physical view.
     void SetLinearHeapArea(u32 vaddr);
     u32 LinearHeapArea() const;
-    // Host pointer for a physical range inside one of: FCRAM [0x20000000, 0x28000000) through
-    // the linear heap (vaddr = paddr - 0x20000000 + the linear heap area), VRAM
+    // Host pointer for a physical range inside one of: FCRAM [0x20000000, 0x28000000), VRAM
     // [0x18000000, 0x18600000) at kVramVaddr, DSP RAM [0x1FF00000, 0x1FF80000). nullptr when
-    // the range leaves its area or, for FCRAM, is not completely mapped. size 0 checks the byte
-    // at paddr.
+    // the range leaves its area or, for FCRAM, no mapped block is its backing. size 0 checks
+    // the byte at paddr.
+    //
+    // FCRAM is reached through the view its bytes were mapped as, not only through the loader's
+    // linear heap: a linear heap block is the window the loader named (0x30000000 on a new
+    // kernel), but the GSP's blocks and the shared font keep the old window (kLinearHeapVaddr,
+    // kernel/shared_memory.cpp), and a heap block can be FCRAM-backed too. A game's PICA
+    // registers hold the physical addresses the GSP gave it, so a view that assumed the one
+    // window left MH4U's colour buffers unreadable and every display transfer empty.
     u8* PhysicalPointer(u32 paddr, u32 size) const;
     // Azahar's GPU::VirtualToPhysicalAddress for VRAM, the old linear heap window and the new one
     // (0x14000000 and 0x30000000 + FCRAM size), plus the DSP RAM. The end of an area is accepted
@@ -296,6 +302,11 @@ private:
 
     bool Init(const GuestMemoryOptions& options);
     bool IsMappedLocked(u32 vaddr, u32 size) const;
+    // PhysicalPointer's FCRAM half: the guest view of FCRAM bytes [paddr, paddr + length).
+    u8* FcramPointerLocked(u32 paddr, u32 length) const;
+    // True when the guest range [vaddr, vaddr + length) is mapped and every byte of it is backed
+    // by the FCRAM bytes [paddr, paddr + length).
+    bool FcramViewLocked(u32 vaddr, u32 paddr, u32 length) const;
     BlockMap::iterator FindBlock(u32 vaddr);
     BlockMap::const_iterator FindBlock(u32 vaddr) const;
     BlockMap::iterator Split(BlockMap::iterator it, u32 offset);
@@ -316,6 +327,15 @@ private:
     BlockMap blocks_;
     std::atomic<u64> map_changes_{0};
     u32 linear_heap_area_ = 0;
+    // The FCRAM views recently resolved, by the page of the offset into FCRAM (the GPU asks for
+    // the same buffer's bytes over and over, a row of tiles at a time). Emptied whenever the map
+    // changes.
+    struct FcramView {
+        u32 offset = 0xFFFFFFFFu;  // the FCRAM offset this view was found for
+        u32 vaddr = 0;
+    };
+    mutable std::array<FcramView, 256> fcram_views_{};
+    mutable u64 fcram_views_generation_ = ~0ull;
 };
 
 // ---- the FCRAM allocator (Azahar's MemoryRegionInfo) -------------------------------------------
