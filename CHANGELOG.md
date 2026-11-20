@@ -28,6 +28,16 @@ main screen.
   without showing any progress. Now the percentage moves the whole way, the screen's timer keeps running, it uses a
   little less memory, and if it goes quiet its log says what it is doing every minute. If yours stopped there, update
   and tap **Go on**: it continues from where it stopped.
+- **The 2D black on a PowerVR (the 32-bit port's phones):** the game's 2D draws with blending off and a logic op in the
+  output merger's register, and on a PowerVR Rogue the driver's fixed-function logic op drew those pixels black (a
+  GE8320 on driver 1.13, Vulkan 1.1.131: the boot's screens, the menus, the HUD and the icons black, while the 3D --
+  which blends, so it never reaches the logic op -- drew right). On a PowerVR the logic op is now emulated in the
+  fragment stage (what the GLES renderer does on the same phones, and what the Vulkan renderer already does on a
+  device without the feature), and a pass loads its attachments instead of beginning with a clear as its load op, as
+  an Adreno on a Vulkan 1.1 driver already does. If the 2D on yours still misses, set gear, **Graphics**, **Renderer**,
+  **GLES**: the renderer built for these phones. MH4N_LOGIC_OP=1 and MH4N_CLEAR_LOAD_OPS=1 take the drivers' own paths
+  back (a test aid).
+
 ### New, from your suggestions
 
 - **PS1 filter**, off by default (gear, **Graphics & Audio**, **PS1 filter**): the look of the 3D games of the late

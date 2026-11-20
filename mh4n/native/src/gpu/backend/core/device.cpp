@@ -448,7 +448,8 @@ void OneCompileAtATime(const Capabilities& c) {
 // command inside it, as every pass did before those patches: the same picture. MH4N_CLEAR_LOAD_OPS=0|1 forces either (a
 // test aid).
 bool ClearLoadOpsFor(const Capabilities& c) {
-    constexpr u32 kVendorQualcomm = 0x5143, kDriverQualcomm = 8;  // (VkDriverId)
+    constexpr u32 kVendorQualcomm = 0x5143, kDriverQualcomm = 8;    // (VkDriverId)
+    constexpr u32 kVendorImagination = 0x1010, kDriverImagination = 7;
     constexpr u32 kVulkan12 = (1u << 22) | (2u << 12);
     const char* env = std::getenv("MH4N_CLEAR_LOAD_OPS");
     if (env != nullptr && (*env == '0' || *env == '1')) {
@@ -457,12 +458,44 @@ bool ClearLoadOpsFor(const Capabilities& c) {
         return *env == '1';
     }
     const bool adreno = c.vendor_id == kVendorQualcomm || c.driver_id == kDriverQualcomm;
+    const bool imagination = c.vendor_id == kVendorImagination || c.driver_id == kDriverImagination;
     if (adreno && c.api_version < kVulkan12) {
         MH4N_LOG(Info, "RHI", "rhi: an Adreno on a Vulkan 1.1 driver: a pass loads its attachments, never a clear as its load "
                               "op (its tiles beside a small render area)");
         return false;
     }
+    if (imagination && c.api_version < kVulkan12) {
+        MH4N_LOG(Info, "RHI", "rhi: a PowerVR on a Vulkan 1.1 driver: a pass loads its attachments, never a clear as its load "
+                              "op (the same class of tiler and driver as the Adreno's)");
+        return false;
+    }
     return true;
+}
+
+// ---- a PowerVR: the logic op emulated in the fragment stage, not the driver's ----
+// The game's 2D (the HUD, the menus, the boot's screens, the icons) draws with blending off and a logic op in
+// the output merger's register (fbops/fixed_function.cpp MakeFixedFunctionState). With the caps' logic_op the
+// pipeline hands that op to the driver's fixed-function blender (state::PlanPipeline), whose implementation on
+// a PowerVR Rogue draws the draw's pixels black instead of applying the op (a GE8320, driver 1.13, Vulkan
+// 1.1.131: every 2D layer black, while the 3D -- which blends, so no logic op -- draws right). The fragment
+// stage's emulation (generator.cpp's mh4n_logic_op over the feedback copy) is what the GLES renderer does on
+// the same phones and what this renderer already runs on a device without the feature, so a PowerVR takes
+// that: caps.logic_op off, as MH4N_RHI_MASK=logic_op would. MH4N_LOGIC_OP=1 takes the driver's back (a test
+// aid), =0 emulates on any GPU.
+bool DriverLogicOpFor(const Capabilities& c) {
+    constexpr u32 kVendorImagination = 0x1010, kDriverImagination = 7;  // (VkDriverId)
+    const char* env = std::getenv("MH4N_LOGIC_OP");
+    if (env != nullptr && (*env == '0' || *env == '1')) {
+        MH4N_LOG(Info, "RHI", "rhi: MH4N_LOGIC_OP={}: the logic op {}", *env,
+                 *env == '1' ? "is the driver's" : "is emulated in the fragment stage on any GPU");
+        return *env == '1';
+    }
+    const bool imagination = c.vendor_id == kVendorImagination || c.driver_id == kDriverImagination;
+    if (imagination) {
+        MH4N_LOG(Info, "RHI", "rhi: a PowerVR draws its logic op through the fragment stage (its fixed-function one "
+                              "draws the 2D black; MH4N_LOGIC_OP=1 takes the driver's back)");
+    }
+    return !imagination;
 }
 
 } // namespace
@@ -478,7 +511,7 @@ Result<std::shared_ptr<Backend>> CreateBackend(std::shared_ptr<Instance> instanc
     if (!combined.ok()) {
         return Error{combined.error()};
     }
-    const CapabilityMask mask = *combined;
+    CapabilityMask mask = *combined;  // (the chosen device's own rule below may add a bit)
 
     // Every physical device, in the order of vkEnumeratePhysicalDevices on the instance.
     u32 count = 0;
@@ -516,6 +549,11 @@ Result<std::shared_ptr<Backend>> CreateBackend(std::shared_ptr<Instance> instanc
         return Error{choice.error};
     }
     const Probe& probe = probes[choice.index];
+    // The chosen device's own rule, on top of the mask (DriverLogicOpFor above): the features and extensions
+    // asked of the driver and the caps below follow it, and the mask's log line says so.
+    if (!DriverLogicOpFor(probe.caps)) {
+        mask = mask.With(Cap::LogicOp);
+    }
 
     // What to enable: the core features the capabilities use, and the optional extensions that are kept
     // (descriptor indexing, scalar block layout, robustness2, buffer device address, sampler mirror
