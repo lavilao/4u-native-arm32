@@ -547,7 +547,7 @@ Options LoadOptions(std::vector<std::string>& log) {
         {"MH4U_TARGET_SCREENS", "target_screens"},
         {"MH4U_TARGET_EAGER", "target_eager"},
         {"MH4U_MONSTERS_ON_MAP", "monsters_on_map"},
-        {"MH4U_DAMAGE_NUMBERS", "damage_numbers"};
+        {"MH4U_DAMAGE_NUMBERS", "damage_numbers"}};
     for (const auto& [var, key] : env) {
         if (const char* value = std::getenv(var)) {
             Set(o, key, value);
