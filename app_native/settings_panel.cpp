@@ -193,6 +193,7 @@ struct Draft {
     // [Colour] (colour_filter.h, Graphics & Audio > Colour): every one 0, the screens as the game draws them
     int hue = 0, temperature = 0, tint = 0, brightness = 0, contrast = 0, saturation = 0, gamma = 0;
     bool stats = false, shadows = true, reverb = true;
+    bool gpu_counters = false;  // mh4u.ini's gpu_counters: the renderer's counters in the log every 60 frames (Advanced)
     bool hd_half = false;  // Texture packs > Pack texture size: half ([Graphics] HdPackSize = half; MH4N_HD_SCALE, 1.0.1)
     bool frame_gen = false;  // [Graphics] FrameGen: a made-up picture between each two of the game's (frame_gen.h)
     bool ps1_filter = false;  // (1.0.1.1) [Graphics] Ps1Filter: the PS1 filter (settings_ps1.inc), off as the app comes
@@ -846,6 +847,7 @@ Draft load() {
     d.dither = game_option_get("dither", render_scale_used(d.scale, d.adreno_fix) > 1 ? "off" : "on");  // (android_main.cpp)
     d.low_end = app_low_end_level(app_setting("Graphics", "LowEnd", "off"));
     d.stats = app_setting_bool("Graphics", "FpsCounter", false);
+    d.gpu_counters = game_option_get("gpu_counters", "0") != "0";
     d.shadows = app_setting_bool("Graphics", "Shadows", true);
     d.hd_half = app_setting("Graphics", "HdPackSize", "full") == "half";
     d.number_size = app_setting("Graphics", "DamageNumberSize", "medium");
@@ -1035,6 +1037,8 @@ bool save() {
         {"bow_aim", &Draft::bow_aim}};
     for (const auto& [key, field] : game)
         if (d.*field != o.*field) game_option_set(key, d.*field);
+    // (gpu_counters is a number in mh4u.ini: the frames between two sets of the renderer's counters, 0 none)
+    if (d.gpu_counters != o.gpu_counters) game_option_set("gpu_counters", d.gpu_counters ? "60" : "0");
     // (S45) the touch screen's corner follows single-screen mode turned on or off: hidden with the menus on the top
     // screen, shown again without them (as at the start, android_main.cpp)
     if (d.single_screen != o.single_screen) {
@@ -3544,6 +3548,13 @@ void rows_graphics_advanced_70(std::vector<Row>& r) {  // [Graphics] FrameGen (f
 }
 void reset_graphics_advanced_70() { s.draft.frame_gen = defaults().frame_gen; }
 MENU_ENTRY("graphics/advanced", 70, rows_graphics_advanced_70, reset_graphics_advanced_70);
+void rows_graphics_advanced_80(std::vector<Row>& r) {  // mh4u.ini's gpu_counters (the renderer's counters in the log)
+    add_choice(r, "gpu_counters", "Renderer counters", s.draft.gpu_counters ? 1 : 0, {tr("Off"), tr("On")},
+               [](int v) { s.draft.gpu_counters = v != 0; }, "gpu_counters");
+    r.back().cold = true;
+}
+void reset_graphics_advanced_80() { s.draft.gpu_counters = defaults().gpu_counters; }
+MENU_ENTRY("graphics/advanced", 80, rows_graphics_advanced_80, reset_graphics_advanced_80);
 
 // ---- Gameplay
 void rows_gameplay_10(std::vector<Row>& r) {
@@ -4576,6 +4587,8 @@ const Help HELP[] = {
      "La GPU de este teléfono no puede hacer imágenes tan grandes: se dibuja con la mayor que puede, después del punto."},
     {"AdrenoFix", "Some old Adreno drivers draw coloured flashes over the 3D picture at a low 3D resolution: Auto draws it at 3x at least there. If your phone shows no flashes, or for more speed, choose Off.",
      "Algunos drivers viejos de Adreno dibujan destellos de colores sobre la imagen 3D con una resolución 3D baja: Automático la dibuja al menos a 3x en ese caso. Si tu teléfono no los muestra, o para ganar velocidad, elige No."},
+    {"gpucounters", "For support: writes the renderer's counters to the log every 60 frames (the draws, the textures that could not be bound and why, the screens' hand-overs). It costs a little speed. Off by default. It applies at the next start.",
+     "Para soporte: escribe en el registro los contadores del renderizador cada 60 cuadros (los dibujos, las texturas que no se pudieron enlazar y por qué, las entregas de las pantallas). Cuesta un poco de velocidad. Apagado por defecto. Se aplica al volver a abrir el juego."},
     {"widescreen", "Match the screen: the top screen as wide as your phone's, with nothing left over. 16:9: that shape, with bars on a wider screen. Off: the 3DS's own shape.",
      "Igual a la pantalla: la pantalla superior tan ancha como la del teléfono, sin bordes. 16:9: esa forma, con barras en una pantalla más ancha. No: la forma de la 3DS."},
     {"single_screen", "The menus of the 3DS's touch screen drawn on the top screen, by the game, in every language: the title menu, quest lists and boards, the canteen, shops, Palico menus, help pages and yes / no questions. The touch screen starts hidden (its button brings it back) and keeps what needs a finger: the town's map, the World Map, the keyboard and the character creation. Off while a code mod is on (jM5557's single-screen mod, Heavenfall): they move the same menus themselves. Based on Heavenfall's single-screen mode, by popzol and BlitzWOLF. It applies at once.",

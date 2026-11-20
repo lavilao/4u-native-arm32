@@ -1492,6 +1492,10 @@ public:
         add("uploads_ahead", frame_.uploads_ahead);
         add("submits_deferred", frame_.submits_deferred);
         add("texture_unavailable", frame_.texture_unavailable);
+        add("tex_unit_off", frame_.tex_unit_off);
+        add("tex_addr_zero", frame_.tex_addr_zero);
+        add("tex_target", frame_.tex_target);
+        add("tex_decoded", frame_.tex_decoded);
         add("sampler_creates", frame_.sampler_creates);
         add("texture_levels_missing", frame_.texture_levels_missing);
         add("ps1_binds", frame_.ps1_binds);
@@ -1676,6 +1680,11 @@ private:
         u64 pingpong_lazy_px = 0;  // ... the pixels their twins were not given (other targets' tiles, gpu4)
         u64 first_draw_clears = 0;  // passes begun with a clear by a draw that writes all of them (FirstDrawClears)
         u64 texture_binds = 0, texture_uploads = 0, texture_unavailable = 0, sampler_creates = 0, texture_levels_missing = 0;
+        // What the draws' unit 0 got (BindUnit), the five ways a draw's main texture can be nothing colour: the unit is off,
+        // an address of 0 (the 1x1 opaque black), none available (texture_unavailable, above, holds these too); and the ones
+        // that came from a colour target's own image or from a decode. The sprite log (DrawImpl, MH4N_SPRITE_LOG) says
+        // which draw it was.
+        u64 tex_unit_off = 0, tex_addr_zero = 0, tex_target = 0, tex_decoded = 0;
         u64 ps1_binds = 0;  // ... of them, sampled nearest for PS1 style's pixelated textures (SetPs1Textures)
         u64 ps1_made = 0, ps1_us = 0;  // PS1 style's smaller copies made (Ps1Small) and the time it took (decode, average, upload)
         u64 ps1_geometry_draws = 0;    // draws with PS1 style's geometry (SetPs1Geometry: affine, snapped)
@@ -4024,6 +4033,15 @@ private:
     //  - "screen": a display transfer whose framebuffer is shown from guest memory (the 1x picture, enlarged by the app);
     //  - "texture": a texture decoded from guest memory under a scaled colour target (not that target itself);
     //  - "load": rows of a scaled colour target loaded from guest memory (the 1x picture, enlarged nearest).
+    // The sprite log (DrawImpl): how many sprites drawn into a screen's own picture are logged in a run, 32 unless
+    // MH4N_SPRITE_LOG says another number (0: none). See BindUnit's `note` for what each draw's unit 0 was.
+    static u32 SpriteLogBudget() {
+        static const u32 budget = [] {
+            const char* v = std::getenv("MH4N_SPRITE_LOG");
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 32u;
+        }();
+        return budget;
+    }
     static u32 ScaleLogLimit() {
         static const u32 limit = [] {
             const char* v = std::getenv("MH4N_SCALE_LOG");
@@ -5917,10 +5935,16 @@ private:
         const Type type = unit == 0 ? static_cast<Type>(pica::BitsOf(params, 28, 3)) : Type::Texture2D;
         const bool cube = type == Type::TextureCube || type == Type::ShadowCube;
         TextureBinding binding;
+        // What the draw's unit 0 got (unit0_kind_, the sprite log): the ways out below, and the sprite log's names.
+        const auto note = [&](u32 kind) {
+            if (unit == 0) unit0_kind_ = kind;
+        };
         if (type == Type::Disabled) {
+            note(6);
             return binding;  // a Disabled unit 0 never reads its texture
         }
         if (type == Type::Shadow2D || type == Type::ShadowCube) {
+            note(7);
             return BindShadowUnit(state);
         }
         EnsureNullTextures();
@@ -5929,9 +5953,13 @@ private:
             return binding;
         };
         if (((regs[texture::kMainConfig] >> unit) & 1) == 0) {
+            if (unit == 0) ++frame_.tex_unit_off;
+            note(1);
             return null_texture(false);  // the unit is off: the software renderer's transparent black
         }
         if (pica::BitsOf(regs[config[unit] + 4], 0, 28) == 0) {
+            if (unit == 0) ++frame_.tex_addr_zero;
+            note(2);
             return null_texture(true);  // an enabled unit with address 0: opaque black
         }
         std::vector<const texture::TextureRef*>& faces = unit_faces_;  // (kept from draw to draw: no allocation)
@@ -5958,12 +5986,14 @@ private:
         }
         if (faces.empty() || (cube && faces.size() != 6)) {
             ++frame_.texture_unavailable;
+            note(5);
             return null_texture(false);
         }
         // A 2D texture that is exactly a colour target held here samples the target's image (at its scale: the game draws
         // its picture through such textures); any other texture is decoded from guest memory, at 1x.
         rhi::Image* image = options_.target_textures && faces.size() == 1 ? TargetAsTexture(state, *faces[0], unit, type == Type::Texture2D)
                                                                           : nullptr;
+        const bool from_target = image != nullptr;
         const bool game_texture = image == nullptr;  // (decoded from guest memory: the only kind PS1 style pixelates)
         if (image == nullptr) {
             if (ScaleLogLimit() != 0 && scale_ > 1) {
@@ -5978,7 +6008,12 @@ private:
         }
         if (image == nullptr) {
             ++frame_.texture_unavailable;
+            note(5);
             return null_texture(false);
+        }
+        if (unit == 0) {
+            ++(from_target ? frame_.tex_target : frame_.tex_decoded);
+            note(from_target ? 3 : 4);
         }
         fragment::sampling::SamplerParams sampler_params = fragment::sampling::SamplerParamsOf(state, unit);
         if (ps1_level_ > 0 && game_texture && !cube && Ps1World(state, unit, *faces[0])) {
@@ -5996,6 +6031,7 @@ private:
         if (!sampler.ok()) {
             MH4N_LOG(Error, kLog, "sampler: {}", sampler.error());
             ++frame_.texture_unavailable;
+            note(5);
             return null_texture(false);
         }
         frame_.sampler_creates += samplers_->creates() - seen_sampler_creates_;
@@ -6075,6 +6111,7 @@ private:
     void BindTextures(const pica::PicaState& state, const fragment::FragmentKey& key, DrawDesc& desc) {
         (void)key;
         const std::array<bool, 3> used = units_read_;  // (UnitsRead(key), DrawImpl's)
+        unit0_kind_ = 0;  // (the sprite log: 0 while the draw's combiner reads no texture at all)
         if (!used[0] && !used[1] && !used[2]) {
             return;
         }
@@ -6789,6 +6826,45 @@ private:
                     }
                     MH4N_LOG(Info, kLog, "DRAW   key {:016x} vertices{}", fragment::HashKey(key), v);
                 }
+            }
+        }
+        // ---- the game's 2D, in the log ----
+        // A 2D layer that came out black while every 3D draw was right (a PowerVR GE8320, 1.0.1.1: the hunting HUD missing,
+        // the dialogs and the icons black), with the driver's logic op and with the shader's alike: what such a draw's colour
+        // is, is its combiner's inputs, so the log takes the first sprites drawn into a screen's own picture, one a game
+        // frame, with the texture they sampled and what the combiner did with it. MH4N_SPRITE_LOG=<n> another number of
+        // them (0: none).
+        if (!shadow_write && color != nullptr && color->screen != nullptr && count != 0 && count <= 8 &&
+            sprite_logs_ < SpriteLogBudget()) {
+            const u64 game_frame = pacing::g_game_frame.load(std::memory_order_relaxed);
+            if (sprite_log_frame_ != game_frame) {
+                sprite_log_frame_ = game_frame;
+                ++sprite_logs_;
+                const auto& r = state.regs;
+                static constexpr std::array<const char*, 8> kUnit0 = {"not read", "off", "address 0 (opaque black)",
+                                                                     "a target's image", "decoded", "unavailable",
+                                                                     "unit 0's type disabled", "shadow"};
+                const rhi::Rect& sc = geometry.scissor;
+                const u32 size_word = r[texture::kTexture0 + 1];
+                MH4N_LOG(Info, kLog, "sprite c {:08x} {}x{} n {} scissor {},{} {}x{} blend {} {}/{} logic {}/{} mask {:x} "
+                                     "at {} depth {} cmp {} t0 {:08x} {}x{} fmt {} unit0 {}",
+                         color->paddr, color->width, color->height, count, sc.x, sc.y, sc.width, sc.height,
+                         ff.blend_enabled, static_cast<int>(ff.src_color), static_cast<int>(ff.dst_color),
+                         ff.logic_op_enabled, static_cast<int>(ff.logic_op), ff.color_write_mask,
+                         static_cast<int>(key.framebuffer.alpha_test_func()), ff.depth_test,
+                         static_cast<int>(ff.depth_compare), pica::BitsOf(r[texture::kTexture0 + 4], 0, 28) * 8,
+                         pica::BitsOf(size_word, 16, 11), pica::BitsOf(size_word, 0, 11),
+                         pica::BitsOf(r[texture::kTexture0Format], 0, 4),
+                         kUnit0[std::min<u32>(unit0_kind_, static_cast<u32>(kUnit0.size()) - 1)]);
+                std::string stages;
+                for (u32 i = 0; i < 6; ++i) {
+                    const fragment::TevStageConfigRaw& st = key.texture.tev_stages[i];
+                    stages += fmt::format(" {}:{}({},{},{})x{}", i, static_cast<int>(st.color_op()), st.color_source(0),
+                                          st.color_source(1), st.color_source(2), 1u << st.color_scale());
+                }
+                MH4N_LOG(Info, kLog, "sprite   type {} combiner input {:x} wide {:x} cpu {} key {:016x} tev{}",
+                         static_cast<int>(key.texture.texture0_type()), key.texture.combiner_buffer_input(),
+                         key.texture.raw, use_cpu, fragment::HashKey(key), stages);
             }
         }
         FragStatsTag(key, color, depth);
@@ -7952,6 +8028,11 @@ private:
     // what DrawImpl takes from the fragment key, kept until the key changes (FragmentState::Prepared::key_changed)
     bool key_memo_valid_ = false;
     std::array<bool, 3> units_read_{};
+    // The sprite log (DrawImpl, MH4N_SPRITE_LOG): what the current draw's unit 0 got (BindUnit's `note`, the kinds are
+    // that method's `note` calls), how many sprites were logged, and at which game frame the last one was
+    u32 unit0_kind_ = 0;
+    u32 sprite_logs_ = 0;
+    u64 sprite_log_frame_ = ~u64{0};
     std::array<const char*, 8> stub_names_{};
     size_t stub_count_ = 0;
     PipelineKey last_ready_key_{};  // the last key PrepareAccelerated found ready (a pipeline never leaves the provider)
