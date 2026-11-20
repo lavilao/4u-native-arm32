@@ -10,8 +10,10 @@
 # empty and registers nothing.
 set(MH4N_REPO_ROOT "${MH4N_ROOT}/..")
 set(MH4N_HOOKS_SOURCE "${MH4N_REPO_ROOT}/port/src/hooks.cpp")
+set(MH4N_GATHER_SOURCE "${MH4N_REPO_ROOT}/port/src/gather.cpp")  # (gather everything in one press, 1.0.1)
 set(MH4N_KEYBOARD_SOURCE "${MH4N_REPO_ROOT}/port/src/swkbd_bridge.cpp")
 set(MH4N_ONESCREEN_SOURCE "${MH4N_REPO_ROOT}/port/src/onescreen.cpp")
+set(MH4N_HUNT_AIDS_SOURCE "${MH4N_REPO_ROOT}/port/src/hunt_aids.cpp")
 set(MH4N_PLATFORM_HEADER "${MH4N_REPO_ROOT}/port/src/platform.h")
 set(MH4N_SCHEDULE_HEADER "${MH4N_REPO_ROOT}/port/src/schedule.h")
 set(MH4N_RECOMP_RUNTIME "${MH4N_REPO_ROOT}/tools/recomp/runtime")
@@ -19,8 +21,11 @@ set(MH4N_RECOMP_RUNTIME "${MH4N_REPO_ROOT}/tools/recomp/runtime")
 if (EXISTS "${MH4N_HOOKS_SOURCE}" AND EXISTS "${MH4N_PLATFORM_HEADER}"
     AND EXISTS "${MH4N_SCHEDULE_HEADER}" AND EXISTS "${MH4N_RECOMP_RUNTIME}/recomp.h")
     set(mh4n_platform_sources platform_native.cpp "${MH4N_HOOKS_SOURCE}" "${MH4N_KEYBOARD_SOURCE}"
-        "${MH4N_ONESCREEN_SOURCE}")
+        "${MH4N_ONESCREEN_SOURCE}" "${MH4N_HUNT_AIDS_SOURCE}")
     set(mh4n_platform_available ON)
+    list(APPEND mh4n_platform_sources "${MH4N_GATHER_SOURCE}")
+    # the health bars' monster names from the game's RomFS (1.0.1.1): this module's own, it reads port/src's hunt aids
+    list(APPEND mh4n_platform_sources monster_names.cpp)
 else()
     message(STATUS "mh4n_platform: port/src/hooks.cpp or recomp.h not found around native/: an empty module")
     set(mh4n_platform_sources unavailable.cpp)
@@ -39,8 +44,11 @@ mh4n_module(
     DEPENDS
         mh4n_runtime
         mh4n_cpu
+        mh4n_ipc
+        mh4n_services_fs
     THIRD_PARTY
         mh4n_fmt
+        mh4n_hdpack_lodepng  # (monster_names.cpp: its zlib inflate, the copy the HD packs use)
 )
 
 if (mh4n_platform_available)
