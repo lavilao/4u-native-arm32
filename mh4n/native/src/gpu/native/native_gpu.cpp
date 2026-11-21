@@ -4062,6 +4062,27 @@ private:
         }();
         return budget;
     }
+    // The 2D log's share a game frame (DrawImpl, MH4N_SPRITE_PER_FRAME, 8): the sprites that bind a unit (the UI's
+    // own) up to this many a game frame; the ones that read no unit, the fades and the letterboxes, one a frame.
+    static u32 SpriteLogPerFrame() {
+        static const u32 per_frame = [] {
+            const char* v = std::getenv("MH4N_SPRITE_PER_FRAME");
+            return v != nullptr ? static_cast<u32>(std::max(1, std::atoi(v))) : 8u;
+        }();
+        return per_frame;
+    }
+    // MH4N_SPRITE_CPU (mh4u.ini's sprite_cpu, DrawImpl): the small draws' (a sprite's, 8 vertices or fewer) vertices
+    // shaded on the CPU whatever the GPU's vertex stage could do — the 2D's A/B test on a phone whose sprites draw
+    // black: the same draw through the interpreter's vertices, the GPU's vertex stage passed by. Sprites that come
+    // out in colour with this on point at the GPU's vertex stage (its program, or its compiler's); still black, the
+    // fragment stage's or the draw's state's.
+    static bool SpriteCpuForced() {
+        static const bool forced = [] {
+            const char* v = std::getenv("MH4N_SPRITE_CPU");
+            return v != nullptr && *v == '1';
+        }();
+        return forced;
+    }
     // The texture colour log (BindUnit's decodes, MH4N_TEX_LOG, 256): the first decodes' average colour, alpha share and
     // five texels. The 2D drew black with every 3D draw right; a texture that decodes black is a decode bug, one that
     // decodes in colour and still draws black is the pipeline's, and this tells the two apart without a round trip.
@@ -6429,6 +6450,11 @@ private:
         // ---- the vertices ----
         const cpuvertex::CpuReason cpu_reason = cpuvertex::CpuPathReason(draw, assembler_.IsEmpty());
         bool use_cpu = cpu_reason != cpuvertex::CpuReason::None;
+        // (MH4N_SPRITE_CPU: a small draw's vertices shaded on the CPU whatever the GPU's vertex stage could do; the
+        // 2D's A/B test, SpriteCpuForced above. cpu_fallback stays false: the draw is the interpreter's own.)
+        if (!use_cpu && draw.num_vertices <= 8 && SpriteCpuForced()) {
+            use_cpu = true;
+        }
         frame_.cpu_gs += cpu_reason == cpuvertex::CpuReason::GeometryShader;
         frame_.cpu_immediate += cpu_reason == cpuvertex::CpuReason::Immediate;
         frame_.cpu_refused += cpu_reason == cpuvertex::CpuReason::Refused;
@@ -6898,26 +6924,42 @@ private:
         // were the boot's own fades and letterboxes: their vertex colours black by the game's own data (the CPU shading
         // said so), no game texture among them (unit 0 off or not read in every take, and no draw on the shader logic op
         // at all: dstcp false in them all), every box read back zero — the budget was gone in the run's first seconds,
-        // before the game's own UI sprites appeared. The budget is 256 sprites now, one a game frame, each with the game's
-        // frame it was drawn in (f) and the units beside unit 0 (u12), and the vertices' own bounding box; every sixteenth
+        // before the game's own UI sprites appeared. The budget is 256 sprites now, the ones that bind a unit (the UI's
+        // own) up to 8 a game frame and the ones that read no unit one a frame, each with the game's frame it was drawn
+        // in (f) and the units beside unit 0 (u12), and the vertices' own bounding box; every sixteenth
         // draw of any size sits beside them (the 3D's own state, to tell the two apart), and a draw whose writes are
-        // masked is said so instead of a readback. For the sprites read back the box its scissor centres is read before
+        // masked is said so instead of a readback. For the sprites read back (the ones that bind a unit: a fade's box
+        // is black before and after, nothing to learn) the box its scissor centres is read before
         // the draw and after it: before with a picture and after black is a draw that blackened it; before and after
         // alike, nothing changed, is a draw that wrote nothing; a before of zeros where the 3D had drawn right is a
         // readback that reads zeros itself. MH4N_SPRITE_LOG=<n> another number of sprites (0: none), MH4N_STREAM_LOG=<n>
-        // of the wider takes, MH4N_SPRITE_READBACK=<n> of the readbacks.
+        // of the wider takes, MH4N_SPRITE_READBACK=<n> of the readbacks, MH4N_SPRITE_PER_FRAME=<n> the share a frame.
         bool sprite_readback = false;  // (the readback of this draw's box, after the draw is submitted)
         std::vector<u8> sprite_readback_before;  // (the same box's pixels before the draw: what the target held)
         if (!shadow_write && color != nullptr && color->image != nullptr && count != 0) {
             const u64 game_frame = pacing::g_game_frame.load(std::memory_order_relaxed);
             const bool sprite = count <= 8;  // (a sprite: a quad or two, not a mesh's many vertices)
+            // The boot's own fades and letterboxes draw first every frame and read no texture: they took the first
+            // take's whole budget (88639f0) before the game's own UI sprites appeared. The sprites that bind a unit
+            // (the UI's own) are taken up to a share a game frame; the rest, the fades and the letterboxes, one a
+            // frame, and no readback of their boxes (a fade's box is black before and after: nothing to learn).
+            if (sprite_log_in_frame_id_ != game_frame) {
+                sprite_log_in_frame_id_ = game_frame;
+                sprite_log_in_frame_ = 0;
+            }
+            const bool unit_read = unit_kinds_[0] != 0 || unit_kinds_[1] != 0 || unit_kinds_[2] != 0;
             const bool sprite_take =
-                sprite && sprite_log_frame_ != game_frame && sprite_logs_ < SpriteLogBudget();
+                sprite && sprite_logs_ < SpriteLogBudget() &&
+                (unit_read ? sprite_log_in_frame_ < SpriteLogPerFrame() : sprite_log_frame_ != game_frame);
             const bool stream_take = !sprite && (++stream_draws_ & 15) == 0 && stream_logs_ < SpriteStreamBudget();
             if (sprite_take || stream_take) {
                 if (sprite_take) {
-                    sprite_log_frame_ = game_frame;
                     ++sprite_logs_;
+                    if (unit_read) {
+                        ++sprite_log_in_frame_;
+                    } else {
+                        sprite_log_frame_ = game_frame;  // (the fades and the letterboxes: one a game frame)
+                    }
                 } else {
                     ++stream_logs_;
                 }
@@ -6937,7 +6979,7 @@ private:
                 const u32 size_word = r[texture::kTexture0 + 1];
                 MH4N_LOG(Info, kLog, "{} f {} c {:08x} {}x{} scale {} fmt {} n {} scissor {},{} {}x{} blend {} {}/{} logic "
                                      "{}/{} mask {:x} at {} depth {}{} cmp {} t0 {:08x} {}x{} fmt {} unit0 {} u12 {}{} "
-                                     "cpu {} self {} load {} dstcp {}",
+                                     "cpu {} self {} load {} dstcp {} fixup {}/{}",
                          sprite ? "sprite" : "stream", game_frame, color->paddr, color->width, color->height, color->scale,
                          color->format, count, sc.x, sc.y, sc.width, sc.height,
                          ff.blend_enabled, static_cast<int>(ff.src_color), static_cast<int>(ff.dst_color),
@@ -6949,7 +6991,8 @@ private:
                          kUnit0[std::min<u32>(unit_kinds_[0], static_cast<u32>(kUnit0.size()) - 1)],
                          kUnitLetter[std::min<u32>(unit_kinds_[1], static_cast<u32>(kUnitLetter.size()) - 1)],
                          kUnitLetter[std::min<u32>(unit_kinds_[2], static_cast<u32>(kUnitLetter.size()) - 1)], use_cpu,
-                         self_sampled_, static_cast<int>(desc.target.color_load), desc.needs.dst_copy);
+                         self_sampled_, static_cast<int>(desc.target.color_load), desc.needs.dst_copy,
+                         needs.fixup_gs ? 1 : 0, pull_draw ? 1 : 0);
                 std::string stages;
                 for (u32 i = 0; i < 6; ++i) {
                     const fragment::TevStageConfigRaw& st = key.texture.tev_stages[i];
@@ -6984,7 +7027,7 @@ private:
                 if (sprite_take && sprite && ff.color_write_mask == 0) {
                     MH4N_LOG(Info, kLog, "sprite   write masked: the draw writes nothing by design");
                 }
-                if (sprite_take && sprite && sprite_readbacks_ < SpriteReadbackBudget() &&
+                if (sprite_take && sprite && unit_read && sprite_readbacks_ < SpriteReadbackBudget() &&
                     ff.color_write_mask != 0) {
                     const s32 iw = static_cast<s32>(color->image->Width()), ih = static_cast<s32>(color->image->Height());
                     const s32 s = static_cast<s32>(std::max<u32>(color->scale, 1));
@@ -8231,6 +8274,8 @@ private:
     std::array<u32, 3> unit_kinds_{};  // each unit's kind; unit 0's own name is what the sprite log prints in full
     u32 sprite_logs_ = 0;
     u64 sprite_log_frame_ = ~u64{0};
+    u32 sprite_log_in_frame_ = 0;   // the sprites that bind a unit logged this game frame (the share, SpriteLogPerFrame)
+    u64 sprite_log_in_frame_id_ = 0;  // the game frame those were counted in (resets each frame)
     // The 2D log's own state (DrawImpl): the wider takes' count and every draw counted into it, the sprites whose
     // box was read back, and the box of the one whose readback is pending (the draw recorded, not yet submitted)
     u32 stream_logs_ = 0;

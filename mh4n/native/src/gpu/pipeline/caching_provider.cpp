@@ -1026,7 +1026,10 @@ CachingOptions CachingOptionsFrom(const Options& options, bool force_ubershader)
     }
     out.warm = options.Has("--warm");
     out.list = !options.Has("--no-pipeline-list");
-    out.driver_cache = !options.Has("--no-driver-cache");
+    // (MH4N_DRIVER_CACHE=0, mh4u.ini's driver_cache = off: the driver's blob neither loaded nor written — a phone
+    // whose picture changed after an update tells a poisoned cache from the build's own this way)
+    const char* driver_cache = std::getenv("MH4N_DRIVER_CACHE");
+    out.driver_cache = !options.Has("--no-driver-cache") && !(driver_cache != nullptr && driver_cache[0] == '0');
     out.spirv_cache = !options.Has("--no-spirv-cache");
     try {
         out.workers = static_cast<u32>(std::min<u64>(options.GetUInt("--pipeline-workers", 0), 16));

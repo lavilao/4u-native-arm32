@@ -229,6 +229,15 @@ struct Options {
     int target_eager = -1;  // target_eager / MH4U_TARGET_EAGER: 0 a screen's picture is handed over at the next transfer
                             // that reads its target, a write or the VBlank, never at its own transfer; unset: the
                             // renderer's own
+    int sprite_cpu = -1;    // sprite_cpu / MH4U_SPRITE_CPU = on: the small draws' (a sprite's, 8 vertices or fewer)
+                            // vertices shaded on the CPU, the GPU's vertex stage passed by; unset: the renderer's own.
+                            // The 2D's A/B test on a phone whose sprites draw black: sprites that come out in colour
+                            // with this on point at the GPU's vertex stage; still black, the fragment stage's.
+    int driver_cache = -1;  // driver_cache / MH4U_DRIVER_CACHE = off: the driver's pipeline cache blob is neither
+                            // loaded nor written (a phone whose picture changed after an update: a poisoned cache
+                            // tells itself from the build's own this way); unset: on
+    int sprite_log = -1;    // sprite_log / MH4U_SPRITE_LOG: the 2D log's sprite budget (256 by default; a session in
+                            // the game's own menus wants more, 1500 or so, MH4N_SPRITE_LOG's number)
     // hud_<part> = dx dy: a part of the hunting HUD moved by this much (top-screen pixels, right and down: the app's
     // layout editor drags it; item_bar is hud_items as an earlier version wrote it)
     float hud_dx[HUD_PART_COUNT] = {}, hud_dy[HUD_PART_COUNT] = {};
@@ -448,6 +457,12 @@ void Set(Options& o, const std::string& key, const std::string& value) {
         o.target_screens = IsOff(value) ? 0 : 1;  // (1 the target's own picture, 0 the upright copy)
     } else if (key == "target_eager") {
         o.target_eager = IsOn(value) ? 1 : 0;
+    } else if (key == "sprite_cpu") {
+        o.sprite_cpu = IsOn(value) ? 1 : 0;
+    } else if (key == "driver_cache") {
+        o.driver_cache = IsOff(value) ? 0 : 1;
+    } else if (key == "sprite_log") {
+        o.sprite_log = static_cast<int>(std::max(0L, std::strtol(value.c_str(), nullptr, 10)));
     } else if (HuntAids::SetOption(key, value)) {
         // monsters_on_map, damage_numbers (hunt_aids.cpp keeps them)
     } else if (key == "trace_state") {
@@ -546,6 +561,9 @@ Options LoadOptions(std::vector<std::string>& log) {
         {"MH4U_TOUCH_SKIP", "touch_skip"},
         {"MH4U_TARGET_SCREENS", "target_screens"},
         {"MH4U_TARGET_EAGER", "target_eager"},
+        {"MH4U_SPRITE_CPU", "sprite_cpu"},
+        {"MH4U_DRIVER_CACHE", "driver_cache"},
+        {"MH4U_SPRITE_LOG", "sprite_log"},
         {"MH4U_MONSTERS_ON_MAP", "monsters_on_map"},
         {"MH4U_DAMAGE_NUMBERS", "damage_numbers"}};
     for (const auto& [var, key] : env) {
@@ -3649,6 +3667,20 @@ std::vector<std::string> Install(const RCodeInfo& info) {
         log.push_back(options.target_eager != 0
                           ? "a screen's picture handed over at its own transfer"
                           : "a screen's picture handed over at the next transfer or the VBlank");
+    }
+    if (options.sprite_cpu >= 0) {
+        SetEnvironment("MH4N_SPRITE_CPU", options.sprite_cpu != 0 ? "1" : "0");
+        log.push_back(options.sprite_cpu != 0 ? "the small draws' vertices shaded on the CPU"
+                                             : "the small draws' vertices on the GPU's vertex stage");
+    }
+    if (options.driver_cache >= 0) {
+        SetEnvironment("MH4N_DRIVER_CACHE", options.driver_cache != 0 ? "1" : "0");
+        log.push_back(options.driver_cache != 0 ? "the driver's pipeline cache wanted"
+                                               : "the driver's pipeline cache off (nothing read or written)");
+    }
+    if (options.sprite_log >= 0) {
+        SetEnvironment("MH4N_SPRITE_LOG", fmt::format("{}", options.sprite_log));
+        log.push_back(fmt::format("the 2D log takes {} sprites", options.sprite_log));
     }
     // (gather.cpp calls the game's functions only when this library has them at this version's addresses)
     if (const std::string why = Gather::Check(info); !why.empty()) log.push_back(why);
