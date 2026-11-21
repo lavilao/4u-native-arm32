@@ -7002,6 +7002,28 @@ private:
                 MH4N_LOG(Info, kLog, "{}   type {} combiner input {:x} wide {:x} cpu {} key {:016x} tev{}",
                          sprite ? "sprite" : "stream", static_cast<int>(key.texture.texture0_type()),
                          key.texture.combiner_buffer_input(), key.texture.raw, use_cpu, fragment::HashKey(key), stages);
+                // The combiner's registers as the game left them, against the key the draw uses (its take is above):
+                // each stage's raw words (sources, modifiers, ops, scales), the combiner buffer's word, and — with the
+                // writes logged (MH4N_SPRITE_TEV, mh4u.ini's sprite_tev) — the last writes the fragment-config
+                // registers took before this draw, with their raw masks. A draw whose key reads no texture while its
+                // registers name one (3, 4, 5 in the sources word's nibbles) says its key is stale — the dirty flags
+                // that re-extract it were cleared without it; one whose registers say what its key does says the
+                // game's own writes never reached them.
+                {
+                    const u32 stage_base[6] = {fragment::freg::kTevStage0, fragment::freg::kTevStage1,
+                                               fragment::freg::kTevStage2, fragment::freg::kTevStage3,
+                                               fragment::freg::kTevStage4, fragment::freg::kTevStage5};
+                    std::string live;
+                    for (u32 i = 0; i < 6; ++i) {
+                        live += fmt::format(" {}:{:x},{:x},{:x},{:x}", i,
+                                             r[stage_base[i] + fragment::freg::kTevSources],
+                                             r[stage_base[i] + fragment::freg::kTevModifiers],
+                                             r[stage_base[i] + fragment::freg::kTevOps],
+                                             r[stage_base[i] + fragment::freg::kTevScales]);
+                    }
+                    MH4N_LOG(Info, kLog, "{}   live tev{} buf {:x}{}", sprite ? "sprite" : "stream", live,
+                             r[fragment::freg::kFogModeAndCombiner], pica::TevWriteLogTail(sprite ? 24 : 8));
+                }
                 // the sprite's own vertices, shaded on the CPU: a sprite with right coordinates and colours that still
                 // comes out black is the fragment stage's; one with no coordinates never reaches the raster at all
                 if (sprite_take && !use_cpu && count <= 6 &&

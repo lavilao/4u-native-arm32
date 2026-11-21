@@ -124,4 +124,15 @@ private:
     u64 gas_lut_writes_ = 0;
 };
 
+// (MH4N_SPRITE_TEV, mh4u.ini's sprite_tev — the raw-combiner dump, for the 2D log's sprite lines: a
+// draw whose key reads no texture while the game surely wrote one that does). The register writers
+// keep a ring of the last writes to the fragment-config registers (0x80-0x105: the texture units,
+// the combiner, the blend) with their raw masks; NativeGpu's sprite log reads the tail of it beside
+// the live registers of the draw. Both run on the command processor's own thread: no lock.
+void TevWriteLogNote(u32 id, u32 mask, u32 value);
+bool TevWriteLogOn();
+// The last `count` writes the ring holds, oldest first, " id:mask=value"; empty while the dump is
+// off or nothing was written yet.
+std::string TevWriteLogTail(u32 count);
+
 } // namespace mh4n::gpu::pica

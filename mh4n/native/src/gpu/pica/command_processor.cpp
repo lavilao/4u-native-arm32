@@ -18,6 +18,8 @@
 #include "gpu/pica/command_processor.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -57,7 +59,52 @@ float LoadFloat(const u8* p) {
     return v;
 }
 
+// (MH4N_SPRITE_TEV, mh4u.ini's sprite_tev — the raw-combiner dump; the ring's reader runs on this
+// thread too, so plain data with no lock)
+bool TevLogOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("MH4N_SPRITE_TEV");
+        return v != nullptr && *v == '1';
+    }();
+    return on;
+}
+constexpr u32 kTevLogEntries = 256;
+struct TevWrite {
+    u32 id;
+    u32 mask;
+    u32 value;
+};
+std::array<TevWrite, kTevLogEntries> g_tev_writes{};
+u32 g_tev_next = 0;
+u32 g_tev_have = 0;  // the ring's fill: it grows to kTevLogEntries and stays
+
 } // namespace
+
+void TevWriteLogNote(u32 id, u32 mask, u32 value) {
+    if (!TevLogOn() || id < 0x80 || id > 0x105) {
+        return;
+    }
+    g_tev_writes[g_tev_next] = TevWrite{id, mask, value};
+    g_tev_next = (g_tev_next + 1) % kTevLogEntries;
+    g_tev_have = g_tev_have < kTevLogEntries ? g_tev_have + 1 : kTevLogEntries;
+}
+
+bool TevWriteLogOn() {
+    return TevLogOn();
+}
+
+std::string TevWriteLogTail(u32 count) {
+    if (!TevLogOn()) {
+        return {};
+    }
+    count = std::min(count, g_tev_have);
+    std::string out;
+    for (u32 i = count; i > 0; --i) {  // the oldest first, the newest last
+        const TevWrite& w = g_tev_writes[(g_tev_next + kTevLogEntries - i) % kTevLogEntries];
+        out += fmt::format(" {:x}:{:x}={:08x}", w.id, w.mask, w.value);
+    }
+    return out;
+}
 
 CommandProcessor::CommandProcessor(gpu::Host& host, Backend& backend)
     : host_(host), backend_(backend), state_(std::make_unique<PicaState>()) {}
@@ -297,6 +344,7 @@ void CommandProcessor::WriteHardwareRegister(u32 id, u32 value) {
     }
     state_->regs[id] = value;
     state_->dirty.Set(id);
+    TevWriteLogNote(id, 0xF, value);
     if (id == reg::kCommandBufferTrigger) {
         SubmitCmdList(0);
     } else if (id == reg::kCommandBufferTrigger + 1) {
@@ -345,6 +393,7 @@ void CommandProcessor::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_
     const u32 write_mask = ExpandMask(mask);
     s.regs[id] = (s.regs[id] & ~write_mask) | (value & write_mask);
     LogWrite(id, mask, value);
+    TevWriteLogNote(id, mask, value);
 
     if (IsSpecialRegister(id)) {
         HandleSpecialReg(id, value, stop_requested);
@@ -366,6 +415,7 @@ void CommandProcessor::WriteInternalRegBatch(u32 id, std::span<const u32> values
     for (const u32 value : values) {
         LogWrite(id, mask, value);
     }
+    TevWriteLogNote(id, mask, values.back());
     s.dirty.Set(id);
 
     if (IsBatchRegister(id)) {

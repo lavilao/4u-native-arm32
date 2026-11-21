@@ -194,10 +194,11 @@ struct Draft {
     int hue = 0, temperature = 0, tint = 0, brightness = 0, contrast = 0, saturation = 0, gamma = 0;
     bool stats = false, shadows = true, reverb = true;
     bool gpu_counters = false;  // mh4u.ini's gpu_counters: the renderer's counters in the log every 60 frames (Advanced)
-    std::string sprite_cpu, driver_cache;  // (Graphics & Audio > Advanced, the 2D's diagnostics: the small draws'
-                                            // vertices shaded on the CPU; the driver's pipeline cache blob left out)
+    std::string sprite_cpu, driver_cache, sprite_tev;  // (Graphics & Audio > Advanced, the 2D's diagnostics: the small
+    // draws' vertices shaded on the CPU; the driver's pipeline cache blob left out; the raw-combiner dump, the
+    // fragment-config registers' own writes beside their live words in the 2D log)
     int sprite_log = 256;                  // (mh4u.ini's sprite_log: how many of the game's own 2D sprites the log tells,
-                                           // 0 none — the three ask the black-2D A/B from the menu, not a hand-edited file)
+                                           // 0 none — the four ask the black-2D A/B from the menu, not a hand-edited file)
     bool hd_half = false;  // Texture packs > Pack texture size: half ([Graphics] HdPackSize = half; MH4N_HD_SCALE, 1.0.1)
     bool frame_gen = false;  // [Graphics] FrameGen: a made-up picture between each two of the game's (frame_gen.h)
     bool ps1_filter = false;  // (1.0.1.1) [Graphics] Ps1Filter: the PS1 filter (settings_ps1.inc), off as the app comes
@@ -269,6 +270,7 @@ Draft defaults() {
     d.steady = "off";
     d.sprite_cpu = "off";
     d.driver_cache = "on";
+    d.sprite_tev = "off";
     d.kick = "ZR", d.target = "ZL", d.skip = "ZR", d.skip_end = "ZL+ZR", d.skip_end_hold = "1.0";
     d.gather_all = "off";
     d.qol_gather = d.qol_flex = d.qol_sharpen = d.qol_rewards = "off";
@@ -856,6 +858,7 @@ Draft load() {
     d.gpu_counters = game_option_get("gpu_counters", "0") != "0";
     d.sprite_cpu = game_option_get("sprite_cpu", f.sprite_cpu);
     d.driver_cache = game_option_get("driver_cache", f.driver_cache);
+    d.sprite_tev = game_option_get("sprite_tev", f.sprite_tev);
     d.sprite_log = std::clamp(std::atoi(game_option_get("sprite_log", std::to_string(f.sprite_log).c_str()).c_str()),
                               0, 5000);
     d.shadows = app_setting_bool("Graphics", "Shadows", true);
@@ -988,7 +991,8 @@ bool dirty() { return !(s.draft == s.saved); }
 // What needs the game to start again: the widescreen, the 3D resolution, the GPU driver, the mods, the 2D's diagnostics
 bool cold_differs(const Draft& a, const Draft& b) {
     return a.widescreen != b.widescreen || a.scale != b.scale || a.driver != b.driver || a.mods != b.mods ||
-           a.sprite_cpu != b.sprite_cpu || a.driver_cache != b.driver_cache || a.sprite_log != b.sprite_log;
+           a.sprite_cpu != b.sprite_cpu || a.driver_cache != b.driver_cache || a.sprite_tev != b.sprite_tev ||
+           a.sprite_log != b.sprite_log;
 }
 
 // The frame rate's cap to the screen's refresh rate (GameActivity.setFrameCap) and to the performance hints
@@ -1047,7 +1051,8 @@ bool save() {
         {"monster_health_bar", &Draft::monster_health_bar}, {"quick_items", &Draft::quick_items},
         {"bow_aim", &Draft::bow_aim},
         // (Graphics & Audio > Advanced, the 2D's diagnostics: the next start)
-        {"sprite_cpu", &Draft::sprite_cpu}, {"driver_cache", &Draft::driver_cache}};
+        {"sprite_cpu", &Draft::sprite_cpu}, {"driver_cache", &Draft::driver_cache},
+        {"sprite_tev", &Draft::sprite_tev}};
     for (const auto& [key, field] : game)
         if (d.*field != o.*field) game_option_set(key, d.*field);
     // (gpu_counters is a number in mh4u.ini: the frames between two sets of the renderer's counters, 0 none)
@@ -3598,6 +3603,20 @@ void rows_graphics_advanced_90(std::vector<Row>& r) {
         "escribe nada de ella, para distinguir una caché envenenada por una actualización (una imagen que cambió después "
         "de una) de la propia de la app. El primer arranque con ella apagada la recompila entera, así que tarda más. Se "
         "aplica al volver a abrir el juego.");
+    add_switch(r, "diag.sprite_tev", en_es("Dump raw TEV registers", "Volcar registros TEV crudos"),
+               &s.draft.sprite_tev, "sprite_tev");
+    r.back().help = en_es(
+        "For support: the 2D log's sprite lines always name the combiner's live registers as the game left them; with "
+        "this on they also name the last writes the fragment-config registers (the texture units', the combiner's, the "
+        "blend's) took before the draw, with their raw write masks. On a phone whose 2D draws black while its textures "
+        "decode fine, whether the game's own combiner writes arrive tells a lost write from a state read too early. A "
+        "little slower with it on. It applies at the next start.",
+        "Para soporte: las líneas de sprite del registro 2D siempre nombran los registros vivos del combinador tal como "
+        "los dejó el juego; con esto encendido también nombran las últimas escrituras que tomaron los registros de "
+        "configuración de fragmentos (los de las unidades de textura, los del combinador, los de la mezcla) antes del "
+        "dibujo, con sus máscaras crudas de escritura. En un teléfono cuyo 2D sale negro mientras sus texturas decodifican "
+        "bien, saber si las escrituras del combinador del juego llegan distingue una escritura perdida de un estado leído "
+        "demasiado pronto. Un poco más lento encendido. Se aplica al volver a abrir el juego.");
     const int log = s.draft.sprite_log;
     const int picked = log == 0 ? 0 : log == 256 ? 1 : log == 1500 ? 2 : -1;
     add_choice(r, "diag.sprite_log", en_es("2D sprite log", "Registro de sprites 2D"), picked, {tr("Off"), "256", "1500"},
@@ -3615,6 +3634,7 @@ void rows_graphics_advanced_90(std::vector<Row>& r) {
 void reset_graphics_advanced_90() {
     s.draft.sprite_cpu = defaults().sprite_cpu;
     s.draft.driver_cache = defaults().driver_cache;
+    s.draft.sprite_tev = defaults().sprite_tev;
     s.draft.sprite_log = defaults().sprite_log;
 }
 MENU_ENTRY("graphics/advanced", 90, rows_graphics_advanced_90, reset_graphics_advanced_90);

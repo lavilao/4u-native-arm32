@@ -238,6 +238,9 @@ struct Options {
                             // tells itself from the build's own this way); unset: on
     int sprite_log = -1;    // sprite_log / MH4U_SPRITE_LOG: the 2D log's sprite budget (256 by default; a session in
                             // the game's own menus wants more, 1500 or so, MH4N_SPRITE_LOG's number)
+    int sprite_tev = -1;    // sprite_tev / MH4U_SPRITE_TEV = on: the 2D log's sprite lines also name the last writes
+                            // the fragment-config registers (0x80-0x105) took before the draw, with their raw masks —
+                            // the raw-combiner dump; unset: the live registers alone (which the lines always name)
     // hud_<part> = dx dy: a part of the hunting HUD moved by this much (top-screen pixels, right and down: the app's
     // layout editor drags it; item_bar is hud_items as an earlier version wrote it)
     float hud_dx[HUD_PART_COUNT] = {}, hud_dy[HUD_PART_COUNT] = {};
@@ -463,6 +466,8 @@ void Set(Options& o, const std::string& key, const std::string& value) {
         o.driver_cache = IsOff(value) ? 0 : 1;
     } else if (key == "sprite_log") {
         o.sprite_log = static_cast<int>(std::max(0L, std::strtol(value.c_str(), nullptr, 10)));
+    } else if (key == "sprite_tev") {
+        o.sprite_tev = IsOn(value) ? 1 : 0;
     } else if (HuntAids::SetOption(key, value)) {
         // monsters_on_map, damage_numbers (hunt_aids.cpp keeps them)
     } else if (key == "trace_state") {
@@ -564,6 +569,7 @@ Options LoadOptions(std::vector<std::string>& log) {
         {"MH4U_SPRITE_CPU", "sprite_cpu"},
         {"MH4U_DRIVER_CACHE", "driver_cache"},
         {"MH4U_SPRITE_LOG", "sprite_log"},
+        {"MH4U_SPRITE_TEV", "sprite_tev"},
         {"MH4U_MONSTERS_ON_MAP", "monsters_on_map"},
         {"MH4U_DAMAGE_NUMBERS", "damage_numbers"}};
     for (const auto& [var, key] : env) {
@@ -3681,6 +3687,11 @@ std::vector<std::string> Install(const RCodeInfo& info) {
     if (options.sprite_log >= 0) {
         SetEnvironment("MH4N_SPRITE_LOG", fmt::format("{}", options.sprite_log));
         log.push_back(fmt::format("the 2D log takes {} sprites", options.sprite_log));
+    }
+    if (options.sprite_tev >= 0) {
+        SetEnvironment("MH4N_SPRITE_TEV", options.sprite_tev != 0 ? "1" : "0");
+        log.push_back(options.sprite_tev != 0 ? "the 2D log's sprites name the combiner's own writes too"
+                                             : "the 2D log's sprites name the combiner's live registers alone");
     }
     // (gather.cpp calls the game's functions only when this library has them at this version's addresses)
     if (const std::string why = Gather::Check(info); !why.empty()) log.push_back(why);
