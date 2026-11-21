@@ -4042,6 +4042,36 @@ private:
         }();
         return budget;
     }
+    // The 2D log's wider take (DrawImpl, MH4N_STREAM_LOG, 32): the sixteenth draw of any size into a colour target,
+    // beside the sprites, so the 3D draws' state sits in the log next to the 2D's and the two can be told apart.
+    static u32 SpriteStreamBudget() {
+        static const u32 budget = [] {
+            const char* v = std::getenv("MH4N_STREAM_LOG");
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 32u;
+        }();
+        return budget;
+    }
+    // The 2D log's readback (DrawImpl, MH4N_SPRITE_READBACK, 16): for the first sprites logged, the box its scissor
+    // centres in the target is read back once the draw is submitted and done, and the log says what it holds: black
+    // pixels over a 3D scene that drew right is a draw that wrote black; the scene's own pixels there is a draw that
+    // wrote nothing at all.
+    static u32 SpriteReadbackBudget() {
+        static const u32 budget = [] {
+            const char* v = std::getenv("MH4N_SPRITE_READBACK");
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 16u;
+        }();
+        return budget;
+    }
+    // The texture colour log (BindUnit's decodes, MH4N_TEX_LOG, 64): the first decodes' average colour, alpha share and
+    // five texels. The 2D drew black with every 3D draw right; a texture that decodes black is a decode bug, one that
+    // decodes in colour and still draws black is the pipeline's, and this tells the two apart without a round trip.
+    static u32 TexLogBudget() {
+        static const u32 budget = [] {
+            const char* v = std::getenv("MH4N_TEX_LOG");
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 64u;
+        }();
+        return budget;
+    }
     static u32 ScaleLogLimit() {
         static const u32 limit = [] {
             const char* v = std::getenv("MH4N_SCALE_LOG");
@@ -4943,6 +4973,37 @@ private:
             ++slow_decodes_told_;
             MH4N_LOG(Info, kLog, "texture {:08x} {}x{} format {}{}: {} us to decode (and hash)", first.paddr, first.width,
                      first.height, static_cast<u32>(first.format), key.cube ? " (cube)" : "", decode_us);
+        }
+        // ---- what the game's 2D sampled, in colour ----
+        // The 2D drew black while every 3D draw was right; what a draw's colour is, is its combiner's inputs, and the
+        // first of them is the texture it sampled. The first TexLogBudget() decodes say their average colour, their
+        // alpha share and five texels (MH4N_TEX_LOG=<n>, 0 none): a texture that decodes black is a decode bug, one
+        // that decodes in colour and still draws black is the pipeline's. Only a decode whose pixels are held
+        // (rgba8 not let go yet) is told; an image's own upload speaks for the ones before it.
+        if (tex_logs_ < TexLogBudget() && !decoded[0]->rgba8.empty()) {
+            ++tex_logs_;
+            const u32 w = first.width, h = first.height;
+            const u8* p = decoded[0]->rgba8.data();
+            const std::size_t n = decoded[0]->rgba8.size() / 4;
+            u64 r = 0, g = 0, b = 0, a = 0, opaque = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                r += p[4 * i];
+                g += p[4 * i + 1];
+                b += p[4 * i + 2];
+                a += p[4 * i + 3];
+                if (p[4 * i + 3] >= 128) ++opaque;
+            }
+            const auto texel = [&](u32 x, u32 y) {
+                const std::size_t i = std::min<std::size_t>(std::size_t{y} * w + x, n - 1);
+                return fmt::format("{:02x}{:02x}{:02x}{:02x}", p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]);
+            };
+            MH4N_LOG(Info, kLog, "texture colour {:08x} {}x{} fmt {}: avg {:02x}{:02x}{:02x} a {}% opaque {}% "
+                                 "texels {} {} {} {} {}",
+                     first.paddr, w, h, static_cast<u32>(first.format),
+                     static_cast<u8>(r / std::max<std::size_t>(n, 1)), static_cast<u8>(g / std::max<std::size_t>(n, 1)),
+                     static_cast<u8>(b / std::max<std::size_t>(n, 1)), 100 * a / std::max<std::size_t>(n, 1),
+                     100 * opaque / std::max<std::size_t>(n, 1), texel(0, 0), texel(w - 1, 0), texel(0, h - 1),
+                     texel(w - 1, h - 1), texel(w / 2, h / 2));
         }
         // An HD pack's texture for this content (hd_textures.h; 2D textures only). An image holding another content's (or the
         // game's own) of another size is made again.
@@ -6831,45 +6892,117 @@ private:
         // ---- the game's 2D, in the log ----
         // A 2D layer that came out black while every 3D draw was right (a PowerVR GE8320, 1.0.1.1: the hunting HUD missing,
         // the dialogs and the icons black), with the driver's logic op and with the shader's alike: what such a draw's colour
-        // is, is its combiner's inputs, so the log takes the first sprites drawn into a screen's own picture, one a game
-        // frame, with the texture they sampled and what the combiner did with it. MH4N_SPRITE_LOG=<n> another number of
-        // them (0: none).
-        if (!shadow_write && color != nullptr && color->screen != nullptr && count != 0 && count <= 8 &&
-            sprite_logs_ < SpriteLogBudget()) {
+        // is, is its combiner's inputs, so the log takes sprites with the texture they sampled and what the combiner did
+        // with it. The first take (42126d3) asked for sprites drawn into a screen's own picture and found not one in a
+        // whole run: this game draws its picture into off-screen targets and hands it to the display transfer, so the
+        // sprites now logged are the small draws (a quad or two) into ANY colour target, one a game frame, with every
+        // sixteenth draw of any size beside them (the 3D's own state, to tell the two apart). For the first 16 sprites
+        // the box its scissor centres is read back once the draw is submitted (sprite pixels in the log): black pixels
+        // over a 3D scene that drew right is a draw that wrote black, the scene's own pixels there is a draw that wrote
+        // nothing. MH4N_SPRITE_LOG=<n> another number of sprites (0: none), MH4N_STREAM_LOG=<n> of the wider takes,
+        // MH4N_SPRITE_READBACK=<n> of the readbacks.
+        bool sprite_readback = false;  // (the readback of this draw's box, after the draw is submitted)
+        if (!shadow_write && color != nullptr && color->image != nullptr && count != 0) {
             const u64 game_frame = pacing::g_game_frame.load(std::memory_order_relaxed);
-            if (sprite_log_frame_ != game_frame) {
-                sprite_log_frame_ = game_frame;
-                ++sprite_logs_;
+            const bool sprite = count <= 8;  // (a sprite: a quad or two, not a mesh's many vertices)
+            const bool sprite_take =
+                sprite && sprite_log_frame_ != game_frame && sprite_logs_ < SpriteLogBudget();
+            const bool stream_take = !sprite && (++stream_draws_ & 15) == 0 && stream_logs_ < SpriteStreamBudget();
+            if (sprite_take || stream_take) {
+                if (sprite_take) {
+                    sprite_log_frame_ = game_frame;
+                    ++sprite_logs_;
+                } else {
+                    ++stream_logs_;
+                }
                 const auto& r = state.regs;
                 static constexpr std::array<const char*, 8> kUnit0 = {"not read", "off", "address 0 (opaque black)",
                                                                      "a target's image", "decoded", "unavailable",
                                                                      "unit 0's type disabled", "shadow"};
                 const rhi::Rect& sc = geometry.scissor;
                 const u32 size_word = r[texture::kTexture0 + 1];
-                MH4N_LOG(Info, kLog, "sprite c {:08x} {}x{} n {} scissor {},{} {}x{} blend {} {}/{} logic {}/{} mask {:x} "
-                                     "at {} depth {} cmp {} t0 {:08x} {}x{} fmt {} unit0 {}",
-                         color->paddr, color->width, color->height, count, sc.x, sc.y, sc.width, sc.height,
+                MH4N_LOG(Info, kLog, "{} c {:08x} {}x{} scale {} fmt {} n {} scissor {},{} {}x{} blend {} {}/{} logic "
+                                     "{}/{} mask {:x} at {} depth {}{} cmp {} t0 {:08x} {}x{} fmt {} unit0 {} cpu {} "
+                                     "self {} load {} dstcp {}",
+                         sprite ? "sprite" : "stream", color->paddr, color->width, color->height, color->scale,
+                         color->format, count, sc.x, sc.y, sc.width, sc.height,
                          ff.blend_enabled, static_cast<int>(ff.src_color), static_cast<int>(ff.dst_color),
                          ff.logic_op_enabled, static_cast<int>(ff.logic_op), ff.color_write_mask,
-                         static_cast<int>(key.framebuffer.alpha_test_func()), ff.depth_test,
+                         static_cast<int>(key.framebuffer.alpha_test_func()), ff.depth_test, ff.depth_write,
                          static_cast<int>(ff.depth_compare), pica::BitsOf(r[texture::kTexture0 + 4], 0, 28) * 8,
                          pica::BitsOf(size_word, 16, 11), pica::BitsOf(size_word, 0, 11),
                          pica::BitsOf(r[texture::kTexture0Format], 0, 4),
-                         kUnit0[std::min<u32>(unit0_kind_, static_cast<u32>(kUnit0.size()) - 1)]);
+                         kUnit0[std::min<u32>(unit0_kind_, static_cast<u32>(kUnit0.size()) - 1)], use_cpu,
+                         self_sampled_, static_cast<int>(desc.target.color_load), desc.needs.dst_copy);
                 std::string stages;
                 for (u32 i = 0; i < 6; ++i) {
                     const fragment::TevStageConfigRaw& st = key.texture.tev_stages[i];
                     stages += fmt::format(" {}:{}({},{},{})x{}", i, static_cast<int>(st.color_op()), st.color_source(0),
                                           st.color_source(1), st.color_source(2), 1u << st.color_scale());
                 }
-                MH4N_LOG(Info, kLog, "sprite   type {} combiner input {:x} wide {:x} cpu {} key {:016x} tev{}",
-                         static_cast<int>(key.texture.texture0_type()), key.texture.combiner_buffer_input(),
-                         key.texture.raw, use_cpu, fragment::HashKey(key), stages);
+                MH4N_LOG(Info, kLog, "{}   type {} combiner input {:x} wide {:x} cpu {} key {:016x} tev{}",
+                         sprite ? "sprite" : "stream", static_cast<int>(key.texture.texture0_type()),
+                         key.texture.combiner_buffer_input(), key.texture.raw, use_cpu, fragment::HashKey(key), stages);
+                // the sprite's own vertices, shaded on the CPU: a sprite with right coordinates and colours that still
+                // comes out black is the fragment stage's; one with no coordinates never reaches the raster at all
+                if (sprite_take && !use_cpu && count <= 6 &&
+                    runner_.Run(host_, draw, cpuvertex::RunMode::VertexOnly) == cpuvertex::RunStatus::Ok) {
+                    seen_cpu_ = runner_.counters();
+                    std::string v;
+                    for (const cpuvertex::OutputVertex& o : runner_.output().vertices) {
+                        v += fmt::format(" ({:.4g},{:.4g},{:.4g},{:.4g} c {:.4g},{:.4g},{:.4g},{:.4g})", o.pos[0], o.pos[1],
+                                         o.pos[2], o.pos[3], o.color[0], o.color[1], o.color[2], o.color[3]);
+                    }
+                    MH4N_LOG(Info, kLog, "sprite   vertices{}", v);
+                }
+                // the readback of this sprite's box: what the target holds once the draw is in (DrawResult below)
+                if (sprite && sprite_readbacks_ < SpriteReadbackBudget()) {
+                    const s32 iw = static_cast<s32>(color->image->Width()), ih = static_cast<s32>(color->image->Height());
+                    const s32 s = static_cast<s32>(std::max<u32>(color->scale, 1));
+                    const s32 cx = static_cast<s32>(sc.x) + static_cast<s32>(sc.width) / 2;   // the scissor's centre,
+                    const s32 cy = static_cast<s32>(sc.y) + static_cast<s32>(sc.height) / 2;  // in 1x pixels
+                    sprite_readback_box_ = rhi::Rect{std::clamp(cx * s - 8, 0, std::max<s32>(iw - 16, 0)),
+                                                    std::clamp(cy * s - 8, 0, std::max<s32>(ih - 16, 0)), 16, 16};
+                    sprite_readback_box_.width = std::min<u32>(16, std::max<s32>(iw, 1) - sprite_readback_box_.x);
+                    sprite_readback_box_.height = std::min<u32>(16, std::max<s32>(ih, 1) - sprite_readback_box_.y);
+                    sprite_readback = sprite_readback_box_.width != 0 && sprite_readback_box_.height != 0;
+                }
             }
         }
         FragStatsTag(key, color, depth);
         rhi::Result<DrawResult> result = composer_->Draw(*rec_, desc);
         FragStatsTag();
+        if (sprite_readback) {  // (the draw is recorded: submit it, wait, and read the box's pixels back)
+            sprite_readback = false;
+            ++sprite_readbacks_;
+            const u32 skipped = result.ok() ? (result->skipped ? 1u : 0u) : 2u;
+            FlushRecording();
+            backend_->WaitIdle();
+            EnsureRecording();
+            rhi::Result<std::vector<u8>> pixels =
+                backend_->ReadImage(*color->image, sprite_readback_box_.x, sprite_readback_box_.y,
+                                    sprite_readback_box_.width, sprite_readback_box_.height);
+            if (!pixels.ok() || pixels->size() < 4 * sprite_readback_box_.width * sprite_readback_box_.height) {
+                MH4N_LOG(Warning, kLog, "sprite pixels c {:08x}: not read back ({})", color->paddr,
+                         pixels.ok() ? std::string("short") : pixels.error());
+            } else {
+                const u8* p = pixels->data();
+                const u32 n = sprite_readback_box_.width * sprite_readback_box_.height;
+                u32 non_zero = 0, non_black = 0;
+                std::string corners;
+                for (u32 i = 0; i < n; ++i) {
+                    if (p[4 * i] | p[4 * i + 1] | p[4 * i + 2] | p[4 * i + 3]) ++non_zero;
+                    if (p[4 * i] | p[4 * i + 1] | p[4 * i + 2]) ++non_black;
+                }
+                for (u32 i : {0u, sprite_readback_box_.width - 1, n - sprite_readback_box_.width, n - 1u, n / 2u}) {
+                    corners += fmt::format(" {:02x}{:02x}{:02x}{:02x}", p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]);
+                }
+                MH4N_LOG(Info, kLog, "sprite pixels c {:08x} box {},{} {}x{} skipped {}: black {}/{} grey {} "
+                                     "corners{}", color->paddr, sprite_readback_box_.x, sprite_readback_box_.y,
+                         sprite_readback_box_.width, sprite_readback_box_.height, skipped, n - non_black, n, n - non_zero,
+                         corners);
+            }
+        }
         if (pingpong && result.ok() && !result->skipped) {
             CommitPingPong(draw_rows);
         }
@@ -7978,6 +8111,7 @@ private:
     u64 texture_spent_us_ = 0;  // this screen's so far (PaceGpu starts it again)
     bool texture_pending_ = false;
     u32 slow_decodes_told_ = 0, slow_creates_told_ = 0, slow_writebacks_told_ = 0;
+    u32 tex_logs_ = 0;  // (the texture colour log's budget: TexLogBudget)
     u64 reserve_checks_ = 0;
     u32 gpu_frames_now_ = 2;  // AdaptGpuFrames
     u32 adapt_transfers_ = 0, adapt_waits_ = 0;
@@ -8033,6 +8167,12 @@ private:
     u32 unit0_kind_ = 0;
     u32 sprite_logs_ = 0;
     u64 sprite_log_frame_ = ~u64{0};
+    // The 2D log's own state (DrawImpl): the wider takes' count and every draw counted into it, the sprites whose
+    // box was read back, and the box of the one whose readback is pending (the draw recorded, not yet submitted)
+    u32 stream_logs_ = 0;
+    u32 stream_draws_ = 0;
+    u32 sprite_readbacks_ = 0;
+    rhi::Rect sprite_readback_box_{};
     std::array<const char*, 8> stub_names_{};
     size_t stub_count_ = 0;
     PipelineKey last_ready_key_{};  // the last key PrepareAccelerated found ready (a pipeline never leaves the provider)
