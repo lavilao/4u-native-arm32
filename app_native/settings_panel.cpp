@@ -194,6 +194,10 @@ struct Draft {
     int hue = 0, temperature = 0, tint = 0, brightness = 0, contrast = 0, saturation = 0, gamma = 0;
     bool stats = false, shadows = true, reverb = true;
     bool gpu_counters = false;  // mh4u.ini's gpu_counters: the renderer's counters in the log every 60 frames (Advanced)
+    std::string sprite_cpu, driver_cache;  // (Graphics & Audio > Advanced, the 2D's diagnostics: the small draws'
+                                            // vertices shaded on the CPU; the driver's pipeline cache blob left out)
+    int sprite_log = 256;                  // (mh4u.ini's sprite_log: how many of the game's own 2D sprites the log tells,
+                                           // 0 none — the three ask the black-2D A/B from the menu, not a hand-edited file)
     bool hd_half = false;  // Texture packs > Pack texture size: half ([Graphics] HdPackSize = half; MH4N_HD_SCALE, 1.0.1)
     bool frame_gen = false;  // [Graphics] FrameGen: a made-up picture between each two of the game's (frame_gen.h)
     bool ps1_filter = false;  // (1.0.1.1) [Graphics] Ps1Filter: the PS1 filter (settings_ps1.inc), off as the app comes
@@ -263,6 +267,8 @@ Draft defaults() {
     d.dither = render_scale_used(d.scale, d.adreno_fix) > 1 ? "off" : "on";  // (a grid above 1x)
     d.antialiasing = "on", d.fov = "1";
     d.steady = "off";
+    d.sprite_cpu = "off";
+    d.driver_cache = "on";
     d.kick = "ZR", d.target = "ZL", d.skip = "ZR", d.skip_end = "ZL+ZR", d.skip_end_hold = "1.0";
     d.gather_all = "off";
     d.qol_gather = d.qol_flex = d.qol_sharpen = d.qol_rewards = "off";
@@ -848,6 +854,10 @@ Draft load() {
     d.low_end = app_low_end_level(app_setting("Graphics", "LowEnd", "off"));
     d.stats = app_setting_bool("Graphics", "FpsCounter", false);
     d.gpu_counters = game_option_get("gpu_counters", "0") != "0";
+    d.sprite_cpu = game_option_get("sprite_cpu", f.sprite_cpu);
+    d.driver_cache = game_option_get("driver_cache", f.driver_cache);
+    d.sprite_log = std::clamp(std::atoi(game_option_get("sprite_log", std::to_string(f.sprite_log).c_str()).c_str()),
+                              0, 5000);
     d.shadows = app_setting_bool("Graphics", "Shadows", true);
     d.hd_half = app_setting("Graphics", "HdPackSize", "full") == "half";
     d.number_size = app_setting("Graphics", "DamageNumberSize", "medium");
@@ -975,9 +985,10 @@ void set_network(const Draft& d) {
 }
 
 bool dirty() { return !(s.draft == s.saved); }
-// What needs the game to start again: the widescreen, the 3D resolution, the GPU driver, the mods
+// What needs the game to start again: the widescreen, the 3D resolution, the GPU driver, the mods, the 2D's diagnostics
 bool cold_differs(const Draft& a, const Draft& b) {
-    return a.widescreen != b.widescreen || a.scale != b.scale || a.driver != b.driver || a.mods != b.mods;
+    return a.widescreen != b.widescreen || a.scale != b.scale || a.driver != b.driver || a.mods != b.mods ||
+           a.sprite_cpu != b.sprite_cpu || a.driver_cache != b.driver_cache || a.sprite_log != b.sprite_log;
 }
 
 // The frame rate's cap to the screen's refresh rate (GameActivity.setFrameCap) and to the performance hints
@@ -1034,11 +1045,15 @@ bool save() {
         {"rewards_send_all", &Draft::rewards_send_all}, {"dlc_flags", &Draft::dlc_flags}, {"effects", &Draft::effects},
         {"monsters_on_map", &Draft::monsters_on_map}, {"damage_numbers", &Draft::damage_numbers},
         {"monster_health_bar", &Draft::monster_health_bar}, {"quick_items", &Draft::quick_items},
-        {"bow_aim", &Draft::bow_aim}};
+        {"bow_aim", &Draft::bow_aim},
+        // (Graphics & Audio > Advanced, the 2D's diagnostics: the next start)
+        {"sprite_cpu", &Draft::sprite_cpu}, {"driver_cache", &Draft::driver_cache}};
     for (const auto& [key, field] : game)
         if (d.*field != o.*field) game_option_set(key, d.*field);
     // (gpu_counters is a number in mh4u.ini: the frames between two sets of the renderer's counters, 0 none)
     if (d.gpu_counters != o.gpu_counters) game_option_set("gpu_counters", d.gpu_counters ? "60" : "0");
+    // (sprite_log is one too: the 2D log's budget, 0 none, 256 the build's own)
+    if (d.sprite_log != o.sprite_log) game_option_set("sprite_log", std::to_string(d.sprite_log));
     // (S45) the touch screen's corner follows single-screen mode turned on or off: hidden with the menus on the top
     // screen, shown again without them (as at the start, android_main.cpp)
     if (d.single_screen != o.single_screen) {
@@ -3555,6 +3570,54 @@ void rows_graphics_advanced_80(std::vector<Row>& r) {  // mh4u.ini's gpu_counter
 }
 void reset_graphics_advanced_80() { s.draft.gpu_counters = defaults().gpu_counters; }
 MENU_ENTRY("graphics/advanced", 80, rows_graphics_advanced_80, reset_graphics_advanced_80);
+// Graphics & Audio > Advanced: the 2D's diagnostics (mh4u.ini, the next start) — the black-2D A/B asked from the menu,
+// for a phone whose owner cannot edit mh4u.ini by hand (no root). One at a time, the picture tried after each: sprites
+// shaded on the CPU (colour: the GPU's vertex stage; black: the fragment stage's or the draw's state's), the driver's
+// pipeline cache left out (a picture that changed after an update), and the log's own budget for a session in the
+// game's menus.
+void rows_graphics_advanced_90(std::vector<Row>& r) {
+    header(r, "diag.head", en_es("2D diagnostics", "Diagnóstico del 2D"));
+    add_switch(r, "diag.sprite_cpu", en_es("Shade sprites on the CPU", "Sombrear sprites en la CPU"),
+               &s.draft.sprite_cpu, "sprite_cpu");
+    r.back().help = en_es(
+        "For support, on a phone whose 2D (the menus, the HUD) draws black: the small draws' vertices are shaded on the "
+        "CPU, the GPU's vertex stage passed by. Sprites that come out in colour with this on point at the GPU's vertex "
+        "stage; still black, at the fragment stage or at the draw's own state. It costs a little speed. It applies at "
+        "the next start.",
+        "Para soporte, en un teléfono cuyo 2D (los menús, el HUD) sale negro: los vértices de los dibujos pequeños se "
+        "sombrean en la CPU, sin pasar por la etapa de vértices de la GPU. Si los sprites salen con color con esto "
+        "encendido, el problema está en la etapa de vértices de la GPU; si siguen negros, en la de fragmentos o en el "
+        "propio estado del dibujo. Cuesta un poco de velocidad. Se aplica al volver a abrir el juego.");
+    add_switch(r, "diag.driver_cache", en_es("Driver pipeline cache", "Caché de pipelines del driver"),
+               &s.draft.driver_cache, "driver_cache");
+    r.back().help = en_es(
+        "The GPU driver's own cache of compiled pipelines, kept between sessions. Off: nothing of it is read or written, "
+        "to tell a cache an update poisoned (a picture that changed after one) from the app's own. The first start with "
+        "it off compiles all of it again, so it takes longer. It applies at the next start.",
+        "La caché propia del driver de la GPU con los pipelines compilados, guardada entre sesiones. No: no se lee ni "
+        "escribe nada de ella, para distinguir una caché envenenada por una actualización (una imagen que cambió después "
+        "de una) de la propia de la app. El primer arranque con ella apagada la recompila entera, así que tarda más. Se "
+        "aplica al volver a abrir el juego.");
+    const int log = s.draft.sprite_log;
+    const int picked = log == 0 ? 0 : log == 256 ? 1 : log == 1500 ? 2 : -1;
+    add_choice(r, "diag.sprite_log", en_es("2D sprite log", "Registro de sprites 2D"), picked, {tr("Off"), "256", "1500"},
+               [](int v) { s.draft.sprite_log = v == 0 ? 0 : v == 1 ? 256 : 1500; }, "sprite_log",
+               picked >= 0 ? std::string() : std::to_string(log));
+    r.back().cold = true;
+    r.back().help = en_es(
+        "For support: how many of the game's own 2D sprites (the menus', the HUD's) are written to the log, each with "
+        "what its box held before and after it drew. Off: none. 256 is the build's own. A session in the game's own "
+        "menus wants 1500 or so. It applies at the next start.",
+        "Para soporte: cuántos sprites 2D propios del juego (los de los menús, los del HUD) se escriben en el registro, "
+        "cada uno con lo que su caja tenía antes y después de dibujar. No: ninguno. 256 es lo propio del build. Un "
+        "recorrido por los menús del juego pide unos 1500. Se aplica al volver a abrir el juego.");
+}
+void reset_graphics_advanced_90() {
+    s.draft.sprite_cpu = defaults().sprite_cpu;
+    s.draft.driver_cache = defaults().driver_cache;
+    s.draft.sprite_log = defaults().sprite_log;
+}
+MENU_ENTRY("graphics/advanced", 90, rows_graphics_advanced_90, reset_graphics_advanced_90);
 
 // ---- Gameplay
 void rows_gameplay_10(std::vector<Row>& r) {
