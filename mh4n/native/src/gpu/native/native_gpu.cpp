@@ -4033,42 +4033,42 @@ private:
     //  - "screen": a display transfer whose framebuffer is shown from guest memory (the 1x picture, enlarged by the app);
     //  - "texture": a texture decoded from guest memory under a scaled colour target (not that target itself);
     //  - "load": rows of a scaled colour target loaded from guest memory (the 1x picture, enlarged nearest).
-    // The sprite log (DrawImpl): how many sprites drawn into a screen's own picture are logged in a run, 32 unless
+    // The sprite log (DrawImpl): how many sprites are logged in a run, 256 unless
     // MH4N_SPRITE_LOG says another number (0: none). See BindUnit's `note` for what each draw's unit 0 was.
     static u32 SpriteLogBudget() {
         static const u32 budget = [] {
             const char* v = std::getenv("MH4N_SPRITE_LOG");
-            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 32u;
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 256u;
         }();
         return budget;
     }
-    // The 2D log's wider take (DrawImpl, MH4N_STREAM_LOG, 32): the sixteenth draw of any size into a colour target,
+    // The 2D log's wider take (DrawImpl, MH4N_STREAM_LOG, 96): the sixteenth draw of any size into a colour target,
     // beside the sprites, so the 3D draws' state sits in the log next to the 2D's and the two can be told apart.
     static u32 SpriteStreamBudget() {
         static const u32 budget = [] {
             const char* v = std::getenv("MH4N_STREAM_LOG");
-            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 32u;
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 96u;
         }();
         return budget;
     }
-    // The 2D log's readback (DrawImpl, MH4N_SPRITE_READBACK, 16): for the first sprites logged, the box its scissor
-    // centres in the target is read back once the draw is submitted and done, and the log says what it holds: black
-    // pixels over a 3D scene that drew right is a draw that wrote black; the scene's own pixels there is a draw that
-    // wrote nothing at all.
+    // The 2D log's readback (DrawImpl, MH4N_SPRITE_READBACK, 48): for the sprites logged, the box its scissor
+    // centres in the target is read before the draw and after it. Before with a picture and after black is a draw that
+    // blackened the box; before and after alike, nothing changed, is a draw that wrote nothing; a before of zeros
+    // where the 3D had drawn right is a readback that reads zeros itself.
     static u32 SpriteReadbackBudget() {
         static const u32 budget = [] {
             const char* v = std::getenv("MH4N_SPRITE_READBACK");
-            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 16u;
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 48u;
         }();
         return budget;
     }
-    // The texture colour log (BindUnit's decodes, MH4N_TEX_LOG, 64): the first decodes' average colour, alpha share and
+    // The texture colour log (BindUnit's decodes, MH4N_TEX_LOG, 256): the first decodes' average colour, alpha share and
     // five texels. The 2D drew black with every 3D draw right; a texture that decodes black is a decode bug, one that
     // decodes in colour and still draws black is the pipeline's, and this tells the two apart without a round trip.
     static u32 TexLogBudget() {
         static const u32 budget = [] {
             const char* v = std::getenv("MH4N_TEX_LOG");
-            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 64u;
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 256u;
         }();
         return budget;
     }
@@ -5996,9 +5996,9 @@ private:
         const Type type = unit == 0 ? static_cast<Type>(pica::BitsOf(params, 28, 3)) : Type::Texture2D;
         const bool cube = type == Type::TextureCube || type == Type::ShadowCube;
         TextureBinding binding;
-        // What the draw's unit 0 got (unit0_kind_, the sprite log): the ways out below, and the sprite log's names.
+        // What the draw's units got (unit_kinds_, the sprite log): the ways out below, and the sprite log's names.
         const auto note = [&](u32 kind) {
-            if (unit == 0) unit0_kind_ = kind;
+            if (unit < 3) unit_kinds_[unit] = kind;
         };
         if (type == Type::Disabled) {
             note(6);
@@ -6172,7 +6172,7 @@ private:
     void BindTextures(const pica::PicaState& state, const fragment::FragmentKey& key, DrawDesc& desc) {
         (void)key;
         const std::array<bool, 3> used = units_read_;  // (UnitsRead(key), DrawImpl's)
-        unit0_kind_ = 0;  // (the sprite log: 0 while the draw's combiner reads no texture at all)
+        unit_kinds_.fill(0);  // (the sprite log: 0 while the draw's combiner reads no texture at all)
         if (!used[0] && !used[1] && !used[2]) {
             return;
         }
@@ -6894,14 +6894,20 @@ private:
         // the dialogs and the icons black), with the driver's logic op and with the shader's alike: what such a draw's colour
         // is, is its combiner's inputs, so the log takes sprites with the texture they sampled and what the combiner did
         // with it. The first take (42126d3) asked for sprites drawn into a screen's own picture and found not one in a
-        // whole run: this game draws its picture into off-screen targets and hands it to the display transfer, so the
-        // sprites now logged are the small draws (a quad or two) into ANY colour target, one a game frame, with every
-        // sixteenth draw of any size beside them (the 3D's own state, to tell the two apart). For the first 16 sprites
-        // the box its scissor centres is read back once the draw is submitted (sprite pixels in the log): black pixels
-        // over a 3D scene that drew right is a draw that wrote black, the scene's own pixels there is a draw that wrote
-        // nothing. MH4N_SPRITE_LOG=<n> another number of sprites (0: none), MH4N_STREAM_LOG=<n> of the wider takes,
-        // MH4N_SPRITE_READBACK=<n> of the readbacks.
+        // whole run; the second (88639f0) took the first 32 small draws into any colour target, and on the Redmi 9 they
+        // were the boot's own fades and letterboxes: their vertex colours black by the game's own data (the CPU shading
+        // said so), no game texture among them (unit 0 off or not read in every take, and no draw on the shader logic op
+        // at all: dstcp false in them all), every box read back zero — the budget was gone in the run's first seconds,
+        // before the game's own UI sprites appeared. The budget is 256 sprites now, one a game frame, each with the game's
+        // frame it was drawn in (f) and the units beside unit 0 (u12), and the vertices' own bounding box; every sixteenth
+        // draw of any size sits beside them (the 3D's own state, to tell the two apart), and a draw whose writes are
+        // masked is said so instead of a readback. For the sprites read back the box its scissor centres is read before
+        // the draw and after it: before with a picture and after black is a draw that blackened it; before and after
+        // alike, nothing changed, is a draw that wrote nothing; a before of zeros where the 3D had drawn right is a
+        // readback that reads zeros itself. MH4N_SPRITE_LOG=<n> another number of sprites (0: none), MH4N_STREAM_LOG=<n>
+        // of the wider takes, MH4N_SPRITE_READBACK=<n> of the readbacks.
         bool sprite_readback = false;  // (the readback of this draw's box, after the draw is submitted)
+        std::vector<u8> sprite_readback_before;  // (the same box's pixels before the draw: what the target held)
         if (!shadow_write && color != nullptr && color->image != nullptr && count != 0) {
             const u64 game_frame = pacing::g_game_frame.load(std::memory_order_relaxed);
             const bool sprite = count <= 8;  // (a sprite: a quad or two, not a mesh's many vertices)
@@ -6919,12 +6925,20 @@ private:
                 static constexpr std::array<const char*, 8> kUnit0 = {"not read", "off", "address 0 (opaque black)",
                                                                      "a target's image", "decoded", "unavailable",
                                                                      "unit 0's type disabled", "shadow"};
+                static constexpr std::array<char, 8> kUnitLetter{'.', '-', '0', 'T', 'D', '!', 'x', 'S'};
+                static bool legend_told = false;  // (the units' letters and the frame, once)
+                if (!legend_told) {
+                    legend_told = true;
+                    MH4N_LOG(Info, kLog, "2D log: f is the game's frame; u12 are the units beside unit 0 (. not read, "
+                                         "- off, 0 address 0, T a target's image, D decoded, ! unavailable, x type "
+                                         "disabled, S shadow)");
+                }
                 const rhi::Rect& sc = geometry.scissor;
                 const u32 size_word = r[texture::kTexture0 + 1];
-                MH4N_LOG(Info, kLog, "{} c {:08x} {}x{} scale {} fmt {} n {} scissor {},{} {}x{} blend {} {}/{} logic "
-                                     "{}/{} mask {:x} at {} depth {}{} cmp {} t0 {:08x} {}x{} fmt {} unit0 {} cpu {} "
-                                     "self {} load {} dstcp {}",
-                         sprite ? "sprite" : "stream", color->paddr, color->width, color->height, color->scale,
+                MH4N_LOG(Info, kLog, "{} f {} c {:08x} {}x{} scale {} fmt {} n {} scissor {},{} {}x{} blend {} {}/{} logic "
+                                     "{}/{} mask {:x} at {} depth {}{} cmp {} t0 {:08x} {}x{} fmt {} unit0 {} u12 {}{} "
+                                     "cpu {} self {} load {} dstcp {}",
+                         sprite ? "sprite" : "stream", game_frame, color->paddr, color->width, color->height, color->scale,
                          color->format, count, sc.x, sc.y, sc.width, sc.height,
                          ff.blend_enabled, static_cast<int>(ff.src_color), static_cast<int>(ff.dst_color),
                          ff.logic_op_enabled, static_cast<int>(ff.logic_op), ff.color_write_mask,
@@ -6932,7 +6946,9 @@ private:
                          static_cast<int>(ff.depth_compare), pica::BitsOf(r[texture::kTexture0 + 4], 0, 28) * 8,
                          pica::BitsOf(size_word, 16, 11), pica::BitsOf(size_word, 0, 11),
                          pica::BitsOf(r[texture::kTexture0Format], 0, 4),
-                         kUnit0[std::min<u32>(unit0_kind_, static_cast<u32>(kUnit0.size()) - 1)], use_cpu,
+                         kUnit0[std::min<u32>(unit_kinds_[0], static_cast<u32>(kUnit0.size()) - 1)],
+                         kUnitLetter[std::min<u32>(unit_kinds_[1], static_cast<u32>(kUnitLetter.size()) - 1)],
+                         kUnitLetter[std::min<u32>(unit_kinds_[2], static_cast<u32>(kUnitLetter.size()) - 1)], use_cpu,
                          self_sampled_, static_cast<int>(desc.target.color_load), desc.needs.dst_copy);
                 std::string stages;
                 for (u32 i = 0; i < 6; ++i) {
@@ -6949,14 +6965,27 @@ private:
                     runner_.Run(host_, draw, cpuvertex::RunMode::VertexOnly) == cpuvertex::RunStatus::Ok) {
                     seen_cpu_ = runner_.counters();
                     std::string v;
+                    float minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f, minw = 1e30f, maxw = -1e30f;
                     for (const cpuvertex::OutputVertex& o : runner_.output().vertices) {
                         v += fmt::format(" ({:.4g},{:.4g},{:.4g},{:.4g} c {:.4g},{:.4g},{:.4g},{:.4g})", o.pos[0], o.pos[1],
                                          o.pos[2], o.pos[3], o.color[0], o.color[1], o.color[2], o.color[3]);
+                        minx = std::min(minx, o.pos[0]), maxx = std::max(maxx, o.pos[0]);
+                        miny = std::min(miny, o.pos[1]), maxy = std::max(maxy, o.pos[1]);
+                        minw = std::min(minw, o.pos[3]), maxw = std::max(maxw, o.pos[3]);
                     }
-                    MH4N_LOG(Info, kLog, "sprite   vertices{}", v);
+                    const auto range = [](float a, float b) {
+                        return a <= b ? fmt::format("[{:.4g},{:.4g}]", a, b) : std::string("[]");
+                    };
+                    MH4N_LOG(Info, kLog, "sprite   bbox x {} y {} w {} vertices{}", range(minx, maxx), range(miny, maxy),
+                             range(minw, maxw), v);
                 }
-                // the readback of this sprite's box: what the target holds once the draw is in (DrawResult below)
-                if (sprite && sprite_readbacks_ < SpriteReadbackBudget()) {
+                // the readback of this sprite's box: what the target holds before the draw and once it is in (below).
+                // A draw whose colour writes are masked writes nothing by design: said so, and no readback for it.
+                if (sprite_take && sprite && ff.color_write_mask == 0) {
+                    MH4N_LOG(Info, kLog, "sprite   write masked: the draw writes nothing by design");
+                }
+                if (sprite_take && sprite && sprite_readbacks_ < SpriteReadbackBudget() &&
+                    ff.color_write_mask != 0) {
                     const s32 iw = static_cast<s32>(color->image->Width()), ih = static_cast<s32>(color->image->Height());
                     const s32 s = static_cast<s32>(std::max<u32>(color->scale, 1));
                     const s32 cx = static_cast<s32>(sc.x) + static_cast<s32>(sc.width) / 2;   // the scissor's centre,
@@ -6968,6 +6997,15 @@ private:
                     sprite_readback = sprite_readback_box_.width != 0 && sprite_readback_box_.height != 0;
                 }
             }
+        }
+        if (sprite_readback) {  // (the box's pixels before the draw: what the target held, often the 3D's own picture)
+            FlushRecording();
+            backend_->WaitIdle();
+            EnsureRecording();
+            rhi::Result<std::vector<u8>> before_pixels =
+                backend_->ReadImage(*color->image, sprite_readback_box_.x, sprite_readback_box_.y,
+                                    sprite_readback_box_.width, sprite_readback_box_.height);
+            sprite_readback_before = before_pixels.ok() ? std::move(*before_pixels) : std::vector<u8>{};
         }
         FragStatsTag(key, color, depth);
         rhi::Result<DrawResult> result = composer_->Draw(*rec_, desc);
@@ -6997,11 +7035,37 @@ private:
                 for (u32 i : {0u, sprite_readback_box_.width - 1, n - sprite_readback_box_.width, n - 1u, n / 2u}) {
                     corners += fmt::format(" {:02x}{:02x}{:02x}{:02x}", p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]);
                 }
-                MH4N_LOG(Info, kLog, "sprite pixels c {:08x} box {},{} {}x{} skipped {}: black {}/{} grey {} "
-                                     "corners{}", color->paddr, sprite_readback_box_.x, sprite_readback_box_.y,
-                         sprite_readback_box_.width, sprite_readback_box_.height, skipped, n - non_black, n, n - non_zero,
-                         corners);
+                // what the box held before the draw, and how many pixels the draw changed: before with a picture and
+                // after black is a draw that blackened the box; before and after alike, nothing changed, is a draw that
+                // wrote nothing; a before of zeros where the 3D had drawn right is a readback that reads zeros itself.
+                const bool have_before = sprite_readback_before.size() == pixels->size();
+                u32 changed = 0;
+                if (have_before) {
+                    const u8* b = sprite_readback_before.data();
+                    for (u32 i = 0; i < n; ++i) {
+                        if (b[4 * i] != p[4 * i] || b[4 * i + 1] != p[4 * i + 1] || b[4 * i + 2] != p[4 * i + 2] ||
+                            b[4 * i + 3] != p[4 * i + 3]) {
+                            ++changed;
+                        }
+                    }
+                }
+                const auto held = [&](const std::vector<u8>& px) -> std::string {
+                    if (px.size() != pixels->size()) return std::string("?");
+                    const u8* q = px.data();
+                    u32 nz = 0, nbk = 0;
+                    for (u32 i = 0; i < n; ++i) {
+                        if (q[4 * i] | q[4 * i + 1] | q[4 * i + 2] | q[4 * i + 3]) ++nz;
+                        if (q[4 * i] | q[4 * i + 1] | q[4 * i + 2]) ++nbk;
+                    }
+                    return fmt::format("black {}/{} grey {}/{}", n - nbk, n, n - nz, n);
+                };
+                MH4N_LOG(Info, kLog, "sprite pixels c {:08x} box {},{} {}x{} skipped {}: before {} after {} "
+                                     "changed {} corners{}", color->paddr, sprite_readback_box_.x, sprite_readback_box_.y,
+                         sprite_readback_box_.width, sprite_readback_box_.height, skipped, held(sprite_readback_before),
+                         fmt::format("black {}/{} grey {}/{}", n - non_black, n, n - non_zero, n),
+                         have_before ? fmt::format("{}/{}", changed, n) : std::string("?"), corners);
             }
+            sprite_readback_before.clear();
         }
         if (pingpong && result.ok() && !result->skipped) {
             CommitPingPong(draw_rows);
@@ -8162,9 +8226,9 @@ private:
     // what DrawImpl takes from the fragment key, kept until the key changes (FragmentState::Prepared::key_changed)
     bool key_memo_valid_ = false;
     std::array<bool, 3> units_read_{};
-    // The sprite log (DrawImpl, MH4N_SPRITE_LOG): what the current draw's unit 0 got (BindUnit's `note`, the kinds are
-    // that method's `note` calls), how many sprites were logged, and at which game frame the last one was
-    u32 unit0_kind_ = 0;
+    // The sprite log (DrawImpl, MH4N_SPRITE_LOG): what the current draw's units got (BindUnit's `note`, the kinds
+    // are that method's `note` calls), how many sprites were logged, and at which game frame the last one was
+    std::array<u32, 3> unit_kinds_{};  // each unit's kind; unit 0's own name is what the sprite log prints in full
     u32 sprite_logs_ = 0;
     u64 sprite_log_frame_ = ~u64{0};
     // The 2D log's own state (DrawImpl): the wider takes' count and every draw counted into it, the sprites whose
