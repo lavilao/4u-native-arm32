@@ -463,6 +463,15 @@ void CommandProcessor::HandleSpecialReg(u32 id, u32 value, bool& stop_requested)
             host_.SignalInterrupt(gpu::Interrupt::P3D, delay_.CalculateAndResetDelay());
             if (regs[reg::kIrqAutostop] != 0) {
                 stop_requested = true;
+                // A stop ends the list early: whatever the list's remaining words would have written (the combiner's
+                // config among them) never lands, and the draws after it run with another draw's state. A measurement
+                // aid for the black-2D phone (whose lists stop, and where).
+                ++list_stops_;
+                if (list_stops_ <= 8 || list_stops_ % 256 == 0) {
+                    MH4N_LOG(Info, kLog, "a command list at {:08x} stopped at word {}/{} by the IRQ autostop (request "
+                                         "{:08x} compare {:08x}, {} so far)",
+                             list_.paddr, list_.index, list_.length, regs[id], regs[reg::kIrqCompare], list_stops_);
+                }
             }
         }
         return;

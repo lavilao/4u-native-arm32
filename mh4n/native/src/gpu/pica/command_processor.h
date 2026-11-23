@@ -122,6 +122,10 @@ private:
     u32 sequence_ = 0;
     u32 lists_ = 0;
     u64 gas_lut_writes_ = 0;
+    // the command lists an IRQ autostop ended before their end (the 2D log's trail: a list whose
+    // combiner writes sit after the stop point would leave the draws after it with another draw's
+    // combiner state — 8 reported, then one in 256)
+    u32 list_stops_ = 0;
 };
 
 // (MH4N_SPRITE_TEV, mh4u.ini's sprite_tev — the raw-combiner dump, for the 2D log's sprite lines: a

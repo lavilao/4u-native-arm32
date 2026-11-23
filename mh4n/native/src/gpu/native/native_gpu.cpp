@@ -6095,8 +6095,10 @@ private:
         }
         if (unit == 0) {
             ++(from_target ? frame_.tex_target : frame_.tex_decoded);
-            note(from_target ? 3 : 4);
         }
+        // (named whatever the unit: the 2D log's u12 said "." for a unit 1 or 2 that bound fine — the game's own
+        // UI samples its textures from unit 1 (sources 4 in the combiner), and the log hid that bind)
+        note(from_target ? 3 : 4);
         fragment::sampling::SamplerParams sampler_params = fragment::sampling::SamplerParamsOf(state, unit);
         if (ps1_level_ > 0 && game_texture && !cube && Ps1World(state, unit, *faces[0])) {
             // PS1 style's pixelated textures: the texels drawn as squares (nearest, no smoothing between them), and from level 2
@@ -6338,6 +6340,16 @@ private:
             touch_fog_ = touch_fog_ || state.fog.lut_dirty;
             touch_gas_ = touch_gas_ || state.gas.table_dirty;
             touch_proctex_ = static_cast<u8>(touch_proctex_ | state.proctex.table_dirty);
+            // The shader setups' own flags (program, swizzle, uniforms): ClearDirty wipes them too, and a loss here is
+            // not a stale uniform but a shader whose program or uniforms the next draw never re-uploads (the 2D's
+            // draws shaded with the 3D scene's left-over colours: black sprites) — 7d7bd0b's follow-up, seen on the
+            // black-2D phone's logs' trail
+            touch_vs_dirty_[0] = touch_vs_dirty_[0] || state.vs.program_dirty;
+            touch_vs_dirty_[1] = touch_vs_dirty_[1] || state.vs.swizzle_dirty;
+            touch_vs_dirty_[2] = touch_vs_dirty_[2] || state.vs.uniforms_dirty;
+            touch_gs_dirty_[0] = touch_gs_dirty_[0] || state.gs.program_dirty;
+            touch_gs_dirty_[1] = touch_gs_dirty_[1] || state.gs.swizzle_dirty;
+            touch_gs_dirty_[2] = touch_gs_dirty_[2] || state.gs.uniforms_dirty;
             touch_pending_ = true;
             if (!runner_saw) {
                 runner_.NoteDraw(draw);
@@ -6360,10 +6372,18 @@ private:
             live.fog.lut_dirty = live.fog.lut_dirty || touch_fog_;
             live.gas.table_dirty = live.gas.table_dirty || touch_gas_;
             live.proctex.table_dirty = static_cast<u8>(live.proctex.table_dirty | touch_proctex_);
+            live.vs.program_dirty = live.vs.program_dirty || touch_vs_dirty_[0];
+            live.vs.swizzle_dirty = live.vs.swizzle_dirty || touch_vs_dirty_[1];
+            live.vs.uniforms_dirty = live.vs.uniforms_dirty || touch_vs_dirty_[2];
+            live.gs.program_dirty = live.gs.program_dirty || touch_gs_dirty_[0];
+            live.gs.swizzle_dirty = live.gs.swizzle_dirty || touch_gs_dirty_[1];
+            live.gs.uniforms_dirty = live.gs.uniforms_dirty || touch_gs_dirty_[2];
             touch_dirty_.Reset();
             touch_lighting_ = 0;
             touch_fog_ = touch_gas_ = false;
             touch_proctex_ = 0;
+            touch_vs_dirty_.fill(false);
+            touch_gs_dirty_.fill(false);
             touch_pending_ = false;
         }
         rhi::Result<fragment::FragmentState::Prepared> prepared = fragment_state_->Prepare(state, geometry.context, tables_.get());
@@ -6979,7 +6999,7 @@ private:
                 const u32 size_word = r[texture::kTexture0 + 1];
                 MH4N_LOG(Info, kLog, "{} f {} c {:08x} {}x{} scale {} fmt {} n {} scissor {},{} {}x{} blend {} {}/{} logic "
                                      "{}/{} mask {:x} at {} depth {}{} cmp {} t0 {:08x} {}x{} fmt {} unit0 {} u12 {}{} "
-                                     "cpu {} self {} load {} dstcp {} fixup {}/{}",
+                                     "cpu {} self {} load {} dstcp {} fixup {}/{} mc {:x}",
                          sprite ? "sprite" : "stream", game_frame, color->paddr, color->width, color->height, color->scale,
                          color->format, count, sc.x, sc.y, sc.width, sc.height,
                          ff.blend_enabled, static_cast<int>(ff.src_color), static_cast<int>(ff.dst_color),
@@ -6992,12 +7012,13 @@ private:
                          kUnitLetter[std::min<u32>(unit_kinds_[1], static_cast<u32>(kUnitLetter.size()) - 1)],
                          kUnitLetter[std::min<u32>(unit_kinds_[2], static_cast<u32>(kUnitLetter.size()) - 1)], use_cpu,
                          self_sampled_, static_cast<int>(desc.target.color_load), desc.needs.dst_copy,
-                         needs.fixup_gs ? 1 : 0, pull_draw ? 1 : 0);
+                         needs.fixup_gs ? 1 : 0, pull_draw ? 1 : 0, r[texture::kMainConfig]);
                 std::string stages;
                 for (u32 i = 0; i < 6; ++i) {
                     const fragment::TevStageConfigRaw& st = key.texture.tev_stages[i];
-                    stages += fmt::format(" {}:{}({},{},{})x{}", i, static_cast<int>(st.color_op()), st.color_source(0),
-                                          st.color_source(1), st.color_source(2), 1u << st.color_scale());
+                    stages += fmt::format(" {}:{}({},{},{})a({},{},{})x{}", i, static_cast<int>(st.color_op()),
+                                          st.color_source(0), st.color_source(1), st.color_source(2), st.alpha_source(0),
+                                          st.alpha_source(1), st.alpha_source(2), 1u << st.color_scale());
                 }
                 MH4N_LOG(Info, kLog, "{}   type {} combiner input {:x} wide {:x} cpu {} key {:016x} tev{}",
                          sprite ? "sprite" : "stream", static_cast<int>(key.texture.texture0_type()),
@@ -8288,6 +8309,9 @@ private:
     u32 touch_lighting_ = 0;
     bool touch_fog_ = false, touch_gas_ = false, touch_pending_ = false;
     u8 touch_proctex_ = 0;
+    // the shader setups' flags the draws left out had set (the carry's text above)
+    std::array<bool, 3> touch_vs_dirty_{};
+    std::array<bool, 3> touch_gs_dirty_{};
     // what DrawImpl takes from the fragment key, kept until the key changes (FragmentState::Prepared::key_changed)
     bool key_memo_valid_ = false;
     std::array<bool, 3> units_read_{};
