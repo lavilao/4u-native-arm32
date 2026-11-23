@@ -6111,6 +6111,23 @@ private:
             }
             ++frame_.ps1_binds;
         }
+        // The sampler must never ask for a level the bound image does not have. This port binds level 0 only
+        // (the note below at texture_binds; Azahar uploads lod.max_level + 1 levels from guest memory), so a
+        // lod_min or lod_max above the image's own levels is undefined in Vulkan. The drivers that show the game
+        // right clamp the level to the image's themselves; the PowerVR Rogue GE8320 read its out-of-range words
+        // as black — and the whole game's 2D went black on that phone, whose UI draws sample a mipmapped atlas
+        // (unit 1, the LOD register the game leaves asking for levels above 0) while every level-0-only texture
+        // drew right. The lod range is clamped here, to the image's own levels, so the ask is defined everywhere
+        // and every device samples the one level the image holds.
+        if (sampler_params.lod_min > image->MipLevels() - 1 || sampler_params.lod_max > image->MipLevels() - 1) {
+            if (++sampler_clamps_ <= 8 || sampler_clamps_ % 256 == 0) {
+                MH4N_LOG(Info, kLog, "the unit {} sampler asked for levels {}..{} of an image with {} level(s): clamped "
+                                     "(the level above the image's is undefined, and a PowerVR reads it black)", unit,
+                         sampler_params.lod_min, sampler_params.lod_max, image->MipLevels());
+            }
+            sampler_params.lod_min = std::min(sampler_params.lod_min, image->MipLevels() - 1);
+            sampler_params.lod_max = std::min(sampler_params.lod_max, image->MipLevels() - 1);
+        }
         rhi::Result<std::shared_ptr<rhi::Sampler>> sampler = samplers_->Get(sampler_params);
         if (!sampler.ok()) {
             MH4N_LOG(Error, kLog, "sampler: {}", sampler.error());
@@ -7046,15 +7063,24 @@ private:
                              r[fragment::freg::kFogModeAndCombiner], pica::TevWriteLogTail(sprite ? 24 : 8));
                 }
                 // the sprite's own vertices, shaded on the CPU: a sprite with right coordinates and colours that still
-                // comes out black is the fragment stage's; one with no coordinates never reaches the raster at all
-                if (sprite_take && !use_cpu && count <= 6 &&
+                // comes out black is the fragment stage's; one with no coordinates never reaches the raster at all.
+                // With the combiner dump on (sprite_tev, the phone's own diagnostic), a stream's first vertices sit
+                // beside them: the UI's own streams are the lit draws whose colour is the open question — their
+                // primary colour is the PICA lighting's own output, and a black one names the vertex stage.
+                const bool vertex_take = (sprite_take && count <= 6) ||
+                                          (stream_take && pica::TevWriteLogOn() && count <= 4096);
+                if (vertex_take && !use_cpu &&
                     runner_.Run(host_, draw, cpuvertex::RunMode::VertexOnly) == cpuvertex::RunStatus::Ok) {
                     seen_cpu_ = runner_.counters();
                     std::string v;
                     float minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f, minw = 1e30f, maxw = -1e30f;
+                    u32 shown = 0;
                     for (const cpuvertex::OutputVertex& o : runner_.output().vertices) {
-                        v += fmt::format(" ({:.4g},{:.4g},{:.4g},{:.4g} c {:.4g},{:.4g},{:.4g},{:.4g})", o.pos[0], o.pos[1],
-                                         o.pos[2], o.pos[3], o.color[0], o.color[1], o.color[2], o.color[3]);
+                        if (shown < 4) {  // (a stream's thousands would overflow the line; four name its colour)
+                            ++shown;
+                            v += fmt::format(" ({:.4g},{:.4g},{:.4g},{:.4g} c {:.4g},{:.4g},{:.4g},{:.4g})", o.pos[0],
+                                             o.pos[1], o.pos[2], o.pos[3], o.color[0], o.color[1], o.color[2], o.color[3]);
+                        }
                         minx = std::min(minx, o.pos[0]), maxx = std::max(maxx, o.pos[0]);
                         miny = std::min(miny, o.pos[1]), maxy = std::max(maxy, o.pos[1]);
                         minw = std::min(minw, o.pos[3]), maxw = std::max(maxw, o.pos[3]);
@@ -7062,8 +7088,8 @@ private:
                     const auto range = [](float a, float b) {
                         return a <= b ? fmt::format("[{:.4g},{:.4g}]", a, b) : std::string("[]");
                     };
-                    MH4N_LOG(Info, kLog, "sprite   bbox x {} y {} w {} vertices{}", range(minx, maxx), range(miny, maxy),
-                             range(minw, maxw), v);
+                    MH4N_LOG(Info, kLog, "{}   bbox x {} y {} w {} vertices{}", sprite ? "sprite" : "stream",
+                             range(minx, maxx), range(miny, maxy), range(minw, maxw), v);
                 }
                 // the readback of this sprite's box: what the target holds before the draw and once it is in (below).
                 // A draw whose colour writes are masked writes nothing by design: said so, and no readback for it.
@@ -8319,6 +8345,7 @@ private:
     // are that method's `note` calls), how many sprites were logged, and at which game frame the last one was
     std::array<u32, 3> unit_kinds_{};  // each unit's kind; unit 0's own name is what the sprite log prints in full
     u32 sprite_logs_ = 0;
+    u32 sampler_clamps_ = 0;  // the sampler LOD ranges clamped to their image's levels (the log names the first)
     u64 sprite_log_frame_ = ~u64{0};
     u32 sprite_log_in_frame_ = 0;   // the sprites that bind a unit logged this game frame (the share, SpriteLogPerFrame)
     u64 sprite_log_in_frame_id_ = 0;  // the game frame those were counted in (resets each frame)
