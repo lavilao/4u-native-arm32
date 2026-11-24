@@ -7,7 +7,8 @@ name: The Android APKs
 
 on:
   push:
-    branches: [main]
+    # lod-hardening builds its own APK here (the hardened ask's device test); the release upload below stays main's alone
+    branches: [main, lod-hardening]
   workflow_dispatch:
 
 permissions:

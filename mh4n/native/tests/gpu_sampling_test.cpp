@@ -1368,12 +1368,15 @@ TEST_CASE("sampling/the_generated_text_routes_unit_3_and_unit_0_Disabled_as_azah
     text = GenerateSpecialisedGlsl(key, profile, ShaderPass::Normal);
     CHECK(text.find("vec4 sampleTexUnit0() {\nreturn vec4(0.0);\n}") != std::string::npos);
     // Azahar's lookups: textureLod with getLod and the bias for the 2D units, the ask clamped to the image's own levels
-    // (a PowerVR reads a LOD above them as black), textureProj for the projection, a cube lookup on (texcoord0, texcoord0_w)
+    // (a PowerVR reads a LOD above them as black) — the clamp hardened: the negative and NaN asks level 0, the upper
+    // bound guarded against a query of 0 — textureProj for the projection, a cube lookup on (texcoord0, texcoord0_w)
     key.texture.set_texture0_type(re::TextureType::Texture2D);
     text = GenerateSpecialisedGlsl(key, profile, ShaderPass::Normal);
     CHECK(text.find("textureLod(sampler2D(tex0, samp0), tcw, lod)") != std::string::npos);
-    CHECK(text.find("clamp(getLod(tc * vec2(textureSize(tex2, 0))) + tex_lod_bias[2], 0.0") != std::string::npos);
-    CHECK(text.find("textureQueryLevels(sampler2D(tex2, samp2))") != std::string::npos);
+    CHECK(text.find("float lod = getLod(tc * vec2(textureSize(tex2, 0))) + tex_lod_bias[2];") != std::string::npos);
+    CHECK(text.find("if (!(lod >= 0.0)) lod = 0.0;") != std::string::npos);
+    CHECK(text.find("lod = min(lod, max(float(textureQueryLevels(sampler2D(tex2, samp2))) - 1.0, 0.0));") != std::string::npos);
+    CHECK(text.find("log2(max(max(d.x, d.y), 1e-9))") != std::string::npos);
     key.texture.set_texture0_type(re::TextureType::Projection2D);
     CHECK(GenerateSpecialisedGlsl(key, profile, ShaderPass::Normal).find("textureProj(sampler2D(tex0, samp0), vec3(tc, texcoord0_w))") != std::string::npos);
     key.texture.set_texture0_type(re::TextureType::TextureCube);

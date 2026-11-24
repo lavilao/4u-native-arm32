@@ -248,7 +248,10 @@ vec4 byteround(vec4 x) {
 
 float getLod(vec2 coord) {
     vec2 d = max(abs(dFdx(coord)), abs(dFdy(coord)));
-    return log2(max(d.x, d.y));
+    // Ours: the log2's argument is floored, so a coordinate that does not change across the primitive (a solid quad's)
+    // makes a large negative finite, not -Inf — a driver whose min/max treat the infinites as NaNs never sees one. A
+    // conformant one clamps the ask to level 0 either way, and a derivative above the floor is untouched by it.
+    return log2(max(max(d.x, d.y), 1e-9));
 }
 
 uvec2 DecodeShadow(uint pixel) {

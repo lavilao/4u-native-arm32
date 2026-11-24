@@ -125,8 +125,13 @@ void EmitLod2D(Emitter& e, u32 unit, const char* result) {
     // image's own levels (the GE8320's UI went black this way, while the draws whose LOD was free drew fine, and its logic
     // op needed a workaround too). On the images the renderer makes, level 0 alone, that is level 0 every time; a
     // conformant driver clamps the level the same way itself, so nothing changes on one.
-    e.Line("float lod = clamp(getLod(tc * vec2(textureSize(tex{0}, 0))) + tex_lod_bias[{0}], 0.0, "
-           "float(textureQueryLevels(sampler2D(tex{0}, samp{0}))) - 1.0);", unit);
+    // Ours, hardened: a negative ask (-Inf where a coordinate does not change, caught by getLod's own floor besides) and
+    // a NaN one (NaN coordinates; the ordered comparison is false for a NaN, so `!(lod >= 0.0)` takes both) are level 0;
+    // the upper bound is guarded on its own account (a driver whose textureQueryLevels answers 0 would make
+    // clamp(x, 0.0, -1.0), whose result is undefined) — min against a bound the guard holds at 0 or above.
+    e.Line("float lod = getLod(tc * vec2(textureSize(tex{0}, 0))) + tex_lod_bias[{0}];", unit);
+    e.Line("if (!(lod >= 0.0)) lod = 0.0;");
+    e.Line("lod = min(lod, max(float(textureQueryLevels(sampler2D(tex{0}, samp{0}))) - 1.0, 0.0));", unit);
     e.Line("{} = textureLod(sampler2D(tex{}, samp{}), tcw, lod);", result, unit, unit);
 }
 
