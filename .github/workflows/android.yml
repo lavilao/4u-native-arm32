@@ -7,7 +7,8 @@ name: The Android APKs
 
 on:
   push:
-    branches: [main]
+    # arm32-minimal builds its own APK here (upstream's renderer, only the 32-bit bring-up); the release upload below stays main's alone
+    branches: [main, arm32-minimal]
   workflow_dispatch:
 
 permissions:
