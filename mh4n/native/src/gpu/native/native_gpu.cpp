@@ -4122,6 +4122,17 @@ private:
         }();
         return budget;
     }
+    // The 2D log's stream readback (DrawImpl, MH4N_STREAM_READBACK, 8): a stream (a draw too big for the sprite
+    // log) that reads a texture unit gets the same box readback a sprite does, this many in a run and one a game
+    // frame. The black-2D phone's own UI draws are streams (the lit ones with the fonts, f 425+ of the title
+    // log), and no readback ever covered them: the sprite budget was spent in the boot's first seconds.
+    static u32 StreamReadbackBudget() {
+        static const u32 budget = [] {
+            const char* v = std::getenv("MH4N_STREAM_READBACK");
+            return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 8u;
+        }();
+        return budget;
+    }
     // The 2D log's share a game frame (DrawImpl, MH4N_SPRITE_PER_FRAME, 8): the sprites that bind a unit (the UI's
     // own) up to this many a game frame; the ones that read no unit, the fades and the letterboxes, one a frame.
     static u32 SpriteLogPerFrame() {
@@ -5128,13 +5139,34 @@ private:
                 const std::size_t i = std::min<std::size_t>(std::size_t{y} * w + x, n - 1);
                 return fmt::format("{:02x}{:02x}{:02x}{:02x}", p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]);
             };
+            // The bytes the decode read, beside the pixels it made of them: pixels near black whose bytes are
+            // alive name the decoder; bytes near zero themselves name the writer (the game's own code, a fill or
+            // a transfer) and clear the decode of it. The black-2D phone's two fullscreen 512x256 RGB8 textures
+            // decoded to an average of 0b0c0b, and which side of the decode the black was on, nothing said.
+            std::string raw = "?";
+            u32 nz = 0, nz_share = 0;
+            const std::size_t enc = texture::EncodedBytes(first.format, w, h);
+            const u32 shown = static_cast<u32>(std::min<std::size_t>(enc, 16));
+            if (const u8* m = host_.PhysicalPointer(first.paddr, static_cast<u32>(enc)); m != nullptr) {
+                raw.clear();
+                for (u32 i = 0; i < shown; ++i) {
+                    raw += fmt::format("{:02x}", m[i]);
+                    nz += m[i] != 0 ? 1 : 0;
+                }
+                const std::size_t probe = std::min<std::size_t>(enc, 1024);
+                u32 alive = 0;
+                for (std::size_t i = 0; i < probe; ++i) {
+                    alive += m[i] != 0 ? 1 : 0;
+                }
+                nz_share = probe != 0 ? static_cast<u32>(100 * alive / probe) : 0;
+            }
             MH4N_LOG(Info, kLog, "texture colour {:08x} {}x{} fmt {}: avg {:02x}{:02x}{:02x} a {}% opaque {}% "
-                                 "texels {} {} {} {} {}",
+                                 "texels {} {} {} {} {} raw {} nz {}/{} {}%",
                      first.paddr, w, h, static_cast<u32>(first.format),
                      static_cast<u8>(r / std::max<std::size_t>(n, 1)), static_cast<u8>(g / std::max<std::size_t>(n, 1)),
                      static_cast<u8>(b / std::max<std::size_t>(n, 1)), 100 * a / std::max<std::size_t>(n, 1),
                      100 * opaque / std::max<std::size_t>(n, 1), texel(0, 0), texel(w - 1, 0), texel(0, h - 1),
-                     texel(w - 1, h - 1), texel(w / 2, h / 2));
+                     texel(w - 1, h - 1), texel(w / 2, h / 2), raw, nz, shown, nz_share);
         }
         // An HD pack's texture for this content (hd_textures.h; 2D textures only). An image holding another content's (or the
         // game's own) of another size is made again.
@@ -7094,8 +7126,10 @@ private:
         // the draw and after it: before with a picture and after black is a draw that blackened it; before and after
         // alike, nothing changed, is a draw that wrote nothing; a before of zeros where the 3D had drawn right is a
         // readback that reads zeros itself. MH4N_SPRITE_LOG=<n> another number of sprites (0: none), MH4N_STREAM_LOG=<n>
-        // of the wider takes, MH4N_SPRITE_READBACK=<n> of the readbacks, MH4N_SPRITE_PER_FRAME=<n> the share a frame.
+        // of the wider takes, MH4N_SPRITE_READBACK=<n> of the readbacks, MH4N_STREAM_READBACK=<n> of the streams' own,
+        // MH4N_SPRITE_PER_FRAME=<n> the share a frame.
         bool sprite_readback = false;  // (the readback of this draw's box, after the draw is submitted)
+        bool readback_stream = false;  // (a stream's box, not a sprite's: the pixels line says so)
         std::vector<u8> sprite_readback_before;  // (the same box's pixels before the draw: what the target held)
         if (!shadow_write && color != nullptr && color->image != nullptr && count != 0) {
             const u64 game_frame = pacing::g_game_frame.load(std::memory_order_relaxed);
@@ -7220,7 +7254,18 @@ private:
                 if (sprite_take && sprite && ff.color_write_mask == 0) {
                     MH4N_LOG(Info, kLog, "sprite   write masked: the draw writes nothing by design");
                 }
-                if (sprite_take && sprite && unit_read && sprite_readbacks_ < SpriteReadbackBudget() &&
+                // A stream that reads a unit — the UI's own bigger draws, the lit ones with the fonts — gets
+                // the same box readback, a few a run and one a game frame: whether those rasterize was the
+                // question their black boxes never answered (the title log's f 425+ had no probe at all).
+                const bool stream_probe = stream_take && unit_read && stream_readbacks_ < StreamReadbackBudget() &&
+                                          stream_readback_frame_ != game_frame && ff.color_write_mask != 0;
+                if (stream_probe) {
+                    ++stream_readbacks_;
+                    stream_readback_frame_ = game_frame;
+                    readback_stream = true;
+                }
+                if ((sprite_take && sprite && unit_read && sprite_readbacks_ < SpriteReadbackBudget() ||
+                     stream_probe) &&
                     ff.color_write_mask != 0) {
                     const s32 iw = static_cast<s32>(color->image->Width()), ih = static_cast<s32>(color->image->Height());
                     const s32 s = static_cast<s32>(std::max<u32>(color->scale, 1));
@@ -7251,7 +7296,9 @@ private:
         FragStatsTag();
         if (sprite_readback) {  // (the draw is recorded: submit it, wait, and read the box's pixels back)
             sprite_readback = false;
-            ++sprite_readbacks_;
+            if (!readback_stream) {
+                ++sprite_readbacks_;
+            }
             const u32 skipped = result.ok() ? (result->skipped ? 1u : 0u) : 2u;
             FlushRecording();
             backend_->WaitIdle();
@@ -7298,8 +7345,9 @@ private:
                     }
                     return fmt::format("black {}/{} grey {}/{}", n - nbk, n, n - nz, n);
                 };
-                MH4N_LOG(Info, kLog, "sprite pixels c {:08x} box {},{} {}x{} skipped {}: before {} after {} "
-                                     "changed {} corners{}", color->paddr, sprite_readback_box_.x, sprite_readback_box_.y,
+                MH4N_LOG(Info, kLog, "{} pixels c {:08x} box {},{} {}x{} skipped {}: before {} after {} "
+                                     "changed {} corners{}", readback_stream ? "stream" : "sprite",
+                         color->paddr, sprite_readback_box_.x, sprite_readback_box_.y,
                          sprite_readback_box_.width, sprite_readback_box_.height, skipped, held(sprite_readback_before),
                          fmt::format("black {}/{} grey {}/{}", n - non_black, n, n - non_zero, n),
                          have_before ? fmt::format("{}/{}", changed, n) : std::string("?"), corners);
@@ -8513,6 +8561,8 @@ private:
     u32 stream_logs_ = 0;
     u32 stream_draws_ = 0;
     u32 sprite_readbacks_ = 0;
+    u32 stream_readbacks_ = 0;              // (the stream readback's budget: StreamReadbackBudget)
+    u64 stream_readback_frame_ = ~u64{0};   // (one stream readback a game frame)
     rhi::Rect sprite_readback_box_{};
     std::array<const char*, 8> stub_names_{};
     size_t stub_count_ = 0;

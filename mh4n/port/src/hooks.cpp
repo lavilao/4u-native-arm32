@@ -258,6 +258,9 @@ struct Options {
     int sprite_tev = -1;    // sprite_tev / MH4U_SPRITE_TEV = on: the 2D log's sprite lines also name the last writes
                             // the fragment-config registers (0x80-0x105) took before the draw, with their raw masks —
                             // the raw-combiner dump; unset: the live registers alone (which the lines always name)
+    int sprite_readback = -1; // sprite_readback / MH4U_SPRITE_READBACK: the 2D log's readbacks (48 by default; a
+                              // session that must reach the game's own UI wants more, for the budget is spent in the
+                              // boot's first seconds otherwise, before the title's own draws appear)
     // hud_<part> = dx dy: a part of the hunting HUD moved by this much (top-screen pixels, right and down: the app's
     // layout editor drags it; item_bar is hud_items as an earlier version wrote it)
     float hud_dx[HUD_PART_COUNT] = {}, hud_dy[HUD_PART_COUNT] = {};
@@ -505,6 +508,8 @@ void Set(Options& o, const std::string& key, const std::string& value) {
         o.sprite_log = static_cast<int>(std::max(0L, std::strtol(value.c_str(), nullptr, 10)));
     } else if (key == "sprite_tev") {
         o.sprite_tev = IsOn(value) ? 1 : 0;
+    } else if (key == "sprite_readback") {
+        o.sprite_readback = static_cast<int>(std::max(0L, std::strtol(value.c_str(), nullptr, 10)));
     } else if (HuntAids::SetOption(key, value)) {
         // monsters_on_map, damage_numbers (hunt_aids.cpp keeps them)
     } else if (WeaponTree::SetOption(key, value)) {
@@ -629,6 +634,7 @@ Options LoadOptions(std::vector<std::string>& log) {
         {"MH4U_DRIVER_CACHE", "driver_cache"},
         {"MH4U_SPRITE_LOG", "sprite_log"},
         {"MH4U_SPRITE_TEV", "sprite_tev"},
+        {"MH4U_SPRITE_READBACK", "sprite_readback"},
         {"MH4U_MONSTERS_ON_MAP", "monsters_on_map"},
         {"MH4U_DAMAGE_NUMBERS", "damage_numbers"}};
     for (const auto& [var, key] : env) {
@@ -4026,6 +4032,10 @@ std::vector<std::string> Install(const RCodeInfo& info) {
         SetEnvironment("MH4N_SPRITE_TEV", options.sprite_tev != 0 ? "1" : "0");
         log.push_back(options.sprite_tev != 0 ? "the 2D log's sprites name the combiner's own writes too"
                                              : "the 2D log's sprites name the combiner's live registers alone");
+    }
+    if (options.sprite_readback >= 0) {
+        SetEnvironment("MH4N_SPRITE_READBACK", fmt::format("{}", options.sprite_readback));
+        log.push_back(fmt::format("the 2D log reads {} sprites' boxes back", options.sprite_readback));
     }
     // (gather.cpp calls the game's functions only when this library has them at this version's addresses)
     if (const std::string why = Gather::Check(info); !why.empty()) log.push_back(why);
