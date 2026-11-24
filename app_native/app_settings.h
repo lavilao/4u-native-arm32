@@ -8,7 +8,8 @@
 //               LowEnd = off|on|toaster (the preset's choice, as the panel last set it), FpsCounter = on|off,
 //               Shadows = on|off (at once: app_live.h), AdrenoFix = auto|off (first_run.h adreno_fix_applies; next start),
 //               Renderer = vulkan|gles (the renderer's driver: the phone's Vulkan, or the alternative OpenGL ES path,
-//               gpu/gles; android_main.cpp picks gles-display for gles; next start)
+//               gpu/gles; android_main.cpp picks gles-display for gles; next start), FastTopScreen = on|off
+//               (off as it comes; at once: shared_screens.h shared_screens_set_fast_top)
 //   [Audio]     Volume = 0..100, Reverb = on|off (at once: app_live.h)
 //   [Display]   Layout = overlay|stacked|side, Corner = bottom-right|bottom-left|top-right|top-left,
 //               Size = 20..60 (% of the window's height), Opacity = 30..100, TouchScreen = shown|hidden
@@ -90,3 +91,11 @@ int app_low_end_level(const std::string& text);
 // (colour_filter.h, shared_screens.cpp), each 0 when the file doesn't have it. Graphics & Audio > Colour writes them.
 struct ColourAdjust;
 void app_colour(ColourAdjust* out);
+// [Colour] Preset1..3 (1.0.2, S13: abelhk96's 4u-native #68): a colour kept to go back to, as the MHGU port's ini has it,
+// "hue,temperature,tint,brightness,contrast,saturation,gamma" (signed whole numbers in that order; no HDR); missing or
+// empty: an empty slot. A number out of its range is clamped; a text that isn't seven numbers is an empty slot, said once
+// in the log. The Colour page writes them at once, as the control profiles (not with the menu's Save).
+inline constexpr int kColourPresets = 3;
+bool app_colour_preset(int n, ColourAdjust* out);  // n 1..3; false: empty
+// Keeps `a` in preset n (nullptr: empties it) and writes the file; false when it can't be written
+bool app_colour_preset_store(int n, const ColourAdjust* a);
