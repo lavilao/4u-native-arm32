@@ -120,7 +120,13 @@ void EmitLod2D(Emitter& e, u32 unit, const char* result) {
         e.Line("{} = textureLod(sampler2D(tex{}, samp{}), tcw, 0.0);", result, unit, unit);
         return;
     }
-    e.Line("float lod = getLod(tc * vec2(textureSize(tex{0}, 0))) + tex_lod_bias[{0}];", unit);
+    // The ask is clamped to the image's own levels, where no driver can misread it: a PowerVR Rogue reads an explicit
+    // textureLod above the image's levels as black, honouring neither the sampler's lod range nor the spec's clamp to the
+    // image's own levels (the GE8320's UI went black this way, while the draws whose LOD was free drew fine, and its logic
+    // op needed a workaround too). On the images the renderer makes, level 0 alone, that is level 0 every time; a
+    // conformant driver clamps the level the same way itself, so nothing changes on one.
+    e.Line("float lod = clamp(getLod(tc * vec2(textureSize(tex{0}, 0))) + tex_lod_bias[{0}], 0.0, "
+           "float(textureQueryLevels(sampler2D(tex{0}, samp{0}))) - 1.0);", unit);
     e.Line("{} = textureLod(sampler2D(tex{}, samp{}), tcw, lod);", result, unit, unit);
 }
 
