@@ -6737,6 +6737,18 @@ private:
             if (ps1_geometry) {
                 batch_.Ps1Snap();  // (the translated stage's PS1 epilogue, on the CPU's positions)
             }
+            // (MH4N_CPU_WHITE=1, the black-2D phone's A/B: every CPU-path vertex's colour white, its alpha kept: a 2D
+            // that comes out in colour then names the vertex colour the CPU path hands the GPU)
+            static const bool cpu_white = [] {
+                const char* v = std::getenv("MH4N_CPU_WHITE");
+                return v != nullptr && *v == '1';
+            }();
+            if (cpu_white) {
+                cpuvertex::HardwareVertex* hv = batch_.MutableData();
+                for (size_t i = 0; i < batch_.VertexCount(); ++i) {
+                    hv[i].color[0] = hv[i].color[1] = hv[i].color[2] = 1.0f;
+                }
+            }
             EnsureRoom(batch_.VertexCount() * cpuvertex::kHardwareVertexStride);
             // held back (its triangles uploaded when it is drawn) unless it reads what it draws or is the stand-in of an
             // accelerated draw
@@ -7249,6 +7261,32 @@ private:
                     MH4N_LOG(Info, kLog, "{}   bbox x {} y {} w {} vertices{}", sprite ? "sprite" : "stream",
                              range(minx, maxx), range(miny, maxy), range(minw, maxw), v);
                 }
+                // A CPU-path draw (the geometry shader's, the game's UI): the vertices it hands the trivial stage, as
+                // they are in the ring (position, colour, texture coordinates 0), the first four and the bounds.
+                if ((sprite_take || stream_take) && use_cpu && !batch_.Empty()) {
+                    std::string v;
+                    float minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f, minw = 1e30f, maxw = -1e30f;
+                    float minc = 1e30f, maxc = -1e30f;
+                    const cpuvertex::HardwareVertex* hv = batch_.Data();
+                    for (size_t i = 0; i < batch_.VertexCount(); ++i) {
+                        const cpuvertex::HardwareVertex& o = hv[i];
+                        if (i < 4) {
+                            v += fmt::format(" ({:.4g},{:.4g},{:.4g},{:.4g} c {:.3g},{:.3g},{:.3g},{:.3g} t {:.4g},{:.4g})",
+                                             o.position[0], o.position[1], o.position[2], o.position[3], o.color[0],
+                                             o.color[1], o.color[2], o.color[3], o.tex_coord0[0], o.tex_coord0[1]);
+                        }
+                        minx = std::min(minx, o.position[0]), maxx = std::max(maxx, o.position[0]);
+                        miny = std::min(miny, o.position[1]), maxy = std::max(maxy, o.position[1]);
+                        minw = std::min(minw, o.position[3]), maxw = std::max(maxw, o.position[3]);
+                        for (u32 c = 0; c < 3; ++c) {
+                            minc = std::min(minc, o.color[c]), maxc = std::max(maxc, o.color[c]);
+                        }
+                    }
+                    MH4N_LOG(Info, kLog, "{}   cpu batch {} vertices: x [{:.4g},{:.4g}] y [{:.4g},{:.4g}] w [{:.4g},{:.4g}] "
+                                         "rgb [{:.3g},{:.3g}] viewport {},{} {}x{} vertices{}",
+                             sprite ? "sprite" : "stream", batch_.VertexCount(), minx, maxx, miny, maxy, minw, maxw, minc, maxc,
+                             geometry.viewport.x, geometry.viewport.y, geometry.viewport.width, geometry.viewport.height, v);
+                }
                 // the readback of this sprite's box: what the target holds before the draw and once it is in (below).
                 // A draw whose colour writes are masked writes nothing by design: said so, and no readback for it.
                 if (sprite_take && sprite && ff.color_write_mask == 0) {
@@ -7275,6 +7313,15 @@ private:
                                                     std::clamp(cy * s - 8, 0, std::max<s32>(ih - 16, 0)), 16, 16};
                     sprite_readback_box_.width = std::min<u32>(16, std::max<s32>(iw, 1) - sprite_readback_box_.x);
                     sprite_readback_box_.height = std::min<u32>(16, std::max<s32>(ih, 1) - sprite_readback_box_.y);
+                    if (use_cpu) {
+                        // (a CPU-path draw: its whole scissor, wherever in it the UI's quads fall; the line then says the
+                        // average colour of the pixels the draw changed, before and after)
+                        const s32 x0 = std::clamp(static_cast<s32>(sc.x) * s, 0, std::max<s32>(iw - 1, 0));
+                        const s32 y0 = std::clamp(static_cast<s32>(sc.y) * s, 0, std::max<s32>(ih - 1, 0));
+                        sprite_readback_box_ = rhi::Rect{
+                            x0, y0, static_cast<u32>(std::clamp(static_cast<s32>(sc.width) * s, 1, iw - x0)),
+                            static_cast<u32>(std::clamp(static_cast<s32>(sc.height) * s, 1, ih - y0))};
+                    }
                     sprite_readback = sprite_readback_box_.width != 0 && sprite_readback_box_.height != 0;
                 }
             }
@@ -7326,14 +7373,25 @@ private:
                 // wrote nothing; a before of zeros where the 3D had drawn right is a readback that reads zeros itself.
                 const bool have_before = sprite_readback_before.size() == pixels->size();
                 u32 changed = 0;
+                u64 sum_before[4] = {}, sum_after[4] = {};  // (the changed pixels' channels, before and after)
                 if (have_before) {
                     const u8* b = sprite_readback_before.data();
                     for (u32 i = 0; i < n; ++i) {
                         if (b[4 * i] != p[4 * i] || b[4 * i + 1] != p[4 * i + 1] || b[4 * i + 2] != p[4 * i + 2] ||
                             b[4 * i + 3] != p[4 * i + 3]) {
                             ++changed;
+                            for (u32 c = 0; c < 4; ++c) {
+                                sum_before[c] += b[4 * i + c];
+                                sum_after[c] += p[4 * i + c];
+                            }
                         }
                     }
+                }
+                if (changed != 0) {
+                    MH4N_LOG(Info, kLog, "{} changed {} px: average before {:02x}{:02x}{:02x}{:02x} after {:02x}{:02x}{:02x}{:02x}",
+                             use_cpu ? "cpu draw" : "draw", changed, sum_before[0] / changed, sum_before[1] / changed,
+                             sum_before[2] / changed, sum_before[3] / changed, sum_after[0] / changed,
+                             sum_after[1] / changed, sum_after[2] / changed, sum_after[3] / changed);
                 }
                 const auto held = [&](const std::vector<u8>& px) -> std::string {
                     if (px.size() != pixels->size()) return std::string("?");

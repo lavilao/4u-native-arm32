@@ -141,6 +141,7 @@ public:
     size_t TriangleCount() const { return vertices_.size() / 3; }
     bool Empty() const { return vertices_.empty(); }
     const HardwareVertex* Data() const { return vertices_.data(); }
+    HardwareVertex* MutableData() { return vertices_.data(); }  // (the 2D A/B: MH4N_CPU_WHITE)
     const std::vector<HardwareVertex>& Vertices() const { return vertices_; }
     // PS1 style's geometry (shader::VertexShaderConfig::ps1, the same on the CPU path): each position divided by its w
     // (w = 1: affine interpolation) with x and y snapped to a grid of 240 cells across each axis; one at or behind the eye

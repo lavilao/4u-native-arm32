@@ -337,7 +337,13 @@ rhi::Result<std::shared_ptr<rhi::Pipeline>> PipelineBuilder::Build(const Pipelin
         }
         vertex_spirv = translated->spirv;
     } else {
-        vertex_spirv = cpuvertex::TrivialVertexShader(backend_->Caps().clip_distance);
+        // (MH4N_TRIVIAL_NOCLIP=1, the black-2D phone's A/B: the CPU path's triangles through the trivial stage that
+        // writes no gl_ClipDistance, as on a Mali, whatever the device has)
+        static const bool no_clip = [] {
+            const char* v = std::getenv("MH4N_TRIVIAL_NOCLIP");
+            return v != nullptr && *v == '1';
+        }();
+        vertex_spirv = cpuvertex::TrivialVertexShader(backend_->Caps().clip_distance && !no_clip);
     }
     desc.vertex.spirv = vertex_spirv;
 
