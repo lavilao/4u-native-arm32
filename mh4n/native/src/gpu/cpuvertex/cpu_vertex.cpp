@@ -25,6 +25,10 @@
 
 #include "gpu/cpuvertex/geometry_pipeline.h"
 #include "mh4n/ab_switches.h"
+#include "mh4n/log.h"
+
+#include <fmt/format.h>
+#include <string>
 #include "gpu/cpuvertex/native_programs.h"
 #include "gpu/cpuvertex/shader_interpreter.h"
 #include "gpu/pica/regs.h"
@@ -641,6 +645,50 @@ RunStatus CpuVertexRunner::Impl::RunLoadVertices(gpu::Host& host, const pica::Dr
                 return Fail(s, error, 0);
             }
             shader_unit.WriteOutput(vs_output_mask, vs_output);
+            // (the black-2D phone: its UI's vertex colours arrive at exactly 0.5 where the combiner wants 1. For the
+            // first geometry-shader draws, vertex 0 as it went in and came out of the vertex stage, and the non-zero
+            // float uniforms of both units: which side of the shader the half is on)
+            static u32 gs_traces = 0;
+            if (index == 0 && mode == RunMode::Full && gs_traces < 4 &&
+                BitsOf(s.regs[reg::kGeometryStage], 0, 2) != 0) {
+                ++gs_traces;
+                std::string in_text, out_text, vs_u, gs_u;
+                for (u32 r = 0; r < 16; ++r) {
+                    const Slot& slot = slots[r];
+                    if (!slot.targeted) continue;
+                    const u8* p = slot.data + slot.offset +
+                                  (slot.constant ? 0 : static_cast<std::size_t>(buffer_vertex) * slot.stride);
+                    std::string raw;
+                    const u32 bytes = slot.components * (slot.kind == vertex::ComponentKind::F32   ? 4u
+                                                         : slot.kind == vertex::ComponentKind::S16 ? 2u
+                                                                                                   : 1u);
+                    for (u32 b = 0; b < bytes && b < 16; ++b) raw += fmt::format("{:02x}", p[b]);
+                    const Vec4& in = shader_unit.input[r];
+                    in_text += fmt::format(" v{}[k{} {}]({:.4g},{:.4g},{:.4g},{:.4g})", r, static_cast<int>(slot.kind), raw,
+                                           in.c[0].value, in.c[1].value, in.c[2].value, in.c[3].value);
+                }
+                for (u32 o = 0; o < 16; ++o) {
+                    if (((vs_output_mask >> o) & 1) == 0) continue;
+                    const Vec4& v = shader_unit.output[shader_unit.output_bank][o];
+                    out_text += fmt::format(" o{}({:.4g},{:.4g},{:.4g},{:.4g})", o, v.c[0].value, v.c[1].value,
+                                            v.c[2].value, v.c[3].value);
+                }
+                const auto uniforms = [](const Uniforms& u, std::string& text) {
+                    for (u32 i = 0; i < 96; ++i) {
+                        const Vec4& v = u.f[i];
+                        if (v.c[0].value == 0 && v.c[1].value == 0 && v.c[2].value == 0 && v.c[3].value == 0) continue;
+                        text += fmt::format(" c{}({:.4g},{:.4g},{:.4g},{:.4g})", i, v.c[0].value, v.c[1].value,
+                                            v.c[2].value, v.c[3].value);
+                    }
+                };
+                uniforms(vs_uniforms, vs_u);
+                uniforms(gs_uniforms, gs_u);
+                MH4N_LOG(Info, "CpuVertex", "gs trace {}: vertex 0 in:{}", gs_traces, in_text);
+                MH4N_LOG(Info, "CpuVertex", "gs trace {}: vertex 0 out (mask {:04x}, map {:08x} {:08x} {:08x}):{}", gs_traces,
+                         vs_output_mask, output_map[0], output_map[1], output_map[2], out_text);
+                MH4N_LOG(Info, "CpuVertex", "gs trace {}: vs uniforms:{}", gs_traces, vs_u);
+                MH4N_LOG(Info, "CpuVertex", "gs trace {}: gs uniforms:{}", gs_traces, gs_u);
+            }
 
             // Cache the vertex when doing indexed rendering.
             if (is_indexed) {
