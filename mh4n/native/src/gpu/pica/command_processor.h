@@ -126,6 +126,7 @@ private:
     // combiner writes sit after the stop point would leave the draws after it with another draw's
     // combiner state — 8 reported, then one in 256)
     u32 list_stops_ = 0;
+    u32 tev6_traces_ = 0;  // (the black-2D phone's trace of its UI's combiner word: WriteInternalReg)
 };
 
 // (MH4N_SPRITE_TEV, mh4u.ini's sprite_tev — the raw-combiner dump, for the 2D log's sprite lines: a

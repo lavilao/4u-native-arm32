@@ -394,6 +394,40 @@ void CommandProcessor::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_
     s.regs[id] = (s.regs[id] & ~write_mask) | (value & write_mask);
     LogWrite(id, mask, value);
     TevWriteLogNote(id, mask, value);
+    // (the black-2D phone: its UI's combiner stage 1 reads source 6, the procedural texture no draw enables, where the
+    // 0.5 its vertex colours assume can only be the constant, 0x0EEF0EEF. Where that word comes from: the list it is
+    // in, the words before it, and every place in FCRAM that holds it or the constant's form, the first few times)
+    if (id == 0xC8 && value == 0x0EEF0E6Fu && tev6_traces_ < 3) {
+        ++tev6_traces_;
+        std::string words;
+        const u32 from = list_.index >= 24 ? list_.index - 24 : 0;
+        for (u32 i = from; i < list_.index + 4; ++i) {
+            words += fmt::format(" {:08x}", ListWord(i));
+        }
+        MH4N_LOG(Info, kLog, "tev6: stage 1 sources 0eef0e6f from list {:08x} word {} of {}:{}", list_.paddr,
+                 list_.index, list_.length, words);
+        if (tev6_traces_ == 1) {
+            std::string bad, good, near;
+            u32 nbad = 0, ngood = 0, nnear = 0;
+            for (u32 page = 0x20000000u; page < 0x30000000u; page += 0x1000u) {
+                const u8* p = host_.PhysicalPointer(page, 0x1000);
+                if (p == nullptr) continue;
+                for (u32 o = 0; o < 0x1000; o += 4) {
+                    const u32 w = Load32(p + o);
+                    if (w == 0x0EEF0E6Fu && nbad++ < 24) bad += fmt::format(" {:08x}", page + o);
+                    if (w == 0x0EEF0EEFu && ngood++ < 24) good += fmt::format(" {:08x}", page + o);
+                    // (the word as a header's neighbour: the value before a write to 0xC8, any mask)
+                    if ((w & 0x0000FFFFu) == 0x00C8u && o >= 4 && (Load32(p + o - 4) & 0xFFFFF0FFu) == 0x0EEF0E0Fu &&
+                        nnear++ < 24) {
+                        near += fmt::format(" {:08x}={:08x}", page + o - 4, Load32(p + o - 4));
+                    }
+                }
+            }
+            MH4N_LOG(Info, kLog, "tev6: FCRAM holds 0eef0e6f {} times:{}", nbad, bad);
+            MH4N_LOG(Info, kLog, "tev6: FCRAM holds 0eef0eef {} times:{}", ngood, good);
+            MH4N_LOG(Info, kLog, "tev6: FCRAM's writes of 0eef0e?f to c8 {}:{}", nnear, near);
+        }
+    }
 
     if (IsSpecialRegister(id)) {
         HandleSpecialReg(id, value, stop_requested);
